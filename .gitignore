@@ -1,0 +1,28 @@
+# Build folders
+/Debug/
+Release/
+
+# IDE metadata
+.cproject
+.project
+.mxproject
+.settings/
+*.launch
+
+# Binary and temporary files
+*.o
+*.elf
+*.hex
+*.bin
+*.map
+*.d
+*.list
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+
+# OS-specific
+.DS_Store
+Thumbs.db
