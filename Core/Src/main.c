@@ -103,6 +103,22 @@ int fputc(int ch, FILE *f)
 
 static BoodOxyData   oxyData;
 static MLX90614_Data mlxData;
+volatile uint8_t currentSensor = 0;
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == blue_button_Pin) {
+        currentSensor = (currentSensor + 1) % 2;
+        printf("Button pressed, switching to sensor: %d\r\n", currentSensor);
+    }
+}
+
+
+void EXTI0_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(blue_button_Pin);
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -617,8 +633,14 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : B1_Pin MEMS_INT1_Pin MEMS_INT2_Pin TP_INT1_Pin */
-  GPIO_InitStruct.Pin = B1_Pin|MEMS_INT1_Pin|MEMS_INT2_Pin|TP_INT1_Pin;
+  /*Configure GPIO pin : blue_button_Pin */
+  GPIO_InitStruct.Pin = blue_button_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(blue_button_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : MEMS_INT1_Pin MEMS_INT2_Pin TP_INT1_Pin */
+  GPIO_InitStruct.Pin = MEMS_INT1_Pin|MEMS_INT2_Pin|TP_INT1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
@@ -699,7 +721,11 @@ void StartDefaultTask(void const * argument)
         printf("BloodOxy sensor not found\r\n");
     }
 
+
     for (;;) {
+    	switch (currentSensor) {
+
+    	case 0:
         // Read ambient temperature
         if (MLX90614_ReadAmbientTemp(&mlxData.ambient) == HAL_OK)
             printf("Ambient: %.2f C\r\n", mlxData.ambient);
@@ -711,14 +737,18 @@ void StartDefaultTask(void const * argument)
             printf("Object: %.2f C\r\n", mlxData.object);
         else
             printf("Object read error\r\n");
-
+        break;
+    	case 1:
         // Read SpO2 and heart rate
         if (BoodOxy_GetHeartbeatSPO2(&oxyData) == HAL_OK) {
             printf("SpO2: %d%%, HR: %ld bpm\r\n", oxyData.spo2, oxyData.heartbeat);
         } else {
             printf("BloodOxy read error\r\n");
         }
+        break;
 
+
+    	}
         osDelay(5000);
     }
 }
