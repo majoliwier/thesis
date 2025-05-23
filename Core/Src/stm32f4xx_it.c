@@ -175,7 +175,10 @@ void TIM6_DAC_IRQHandler(void)
 
   /* USER CODE END TIM6_DAC_IRQn 1 */
 }
-
+void EXTI0_IRQHandler(void)
+{
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_0);
+}
 /**
   * @brief This function handles USB On The Go HS global interrupt.
   */

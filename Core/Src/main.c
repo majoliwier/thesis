@@ -107,17 +107,13 @@ volatile uint8_t currentSensor = 0;
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-    if (GPIO_Pin == blue_button_Pin) {
+    if (GPIO_Pin == GPIO_PIN_0) {
         currentSensor = (currentSensor + 1) % 2;
-        printf("Button pressed, switching to sensor: %d\r\n", currentSensor);
+        printf("Przycisk wcisniety - aktualny sensor: %d\r\n", currentSensor);
+        HAL_GPIO_TogglePin(GPIOG, LD3_Pin);
     }
 }
 
-
-void EXTI0_IRQHandler(void)
-{
-    HAL_GPIO_EXTI_IRQHandler(blue_button_Pin);
-}
 
 /* USER CODE END 0 */
 
@@ -129,7 +125,8 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+	__HAL_RCC_PWR_CLK_ENABLE();
+	HAL_PWR_DisableWakeUpPin(PWR_WAKEUP_PIN1);
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -633,11 +630,15 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : blue_button_Pin */
-  GPIO_InitStruct.Pin = blue_button_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(blue_button_GPIO_Port, &GPIO_InitStruct);
+  /*Configure GPIO pin : PA0 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* Enable and set EXTI line 0 Interrupt to a lower priority */
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
 
   /*Configure GPIO pins : MEMS_INT1_Pin MEMS_INT2_Pin TP_INT1_Pin */
   GPIO_InitStruct.Pin = MEMS_INT1_Pin|MEMS_INT2_Pin|TP_INT1_Pin;
@@ -723,6 +724,9 @@ void StartDefaultTask(void const * argument)
 
 
     for (;;) {
+//    	uint8_t btn = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0);
+//    	printf("PA0: %d\r\n", btn);
+//    	HAL_Delay(500);
     	switch (currentSensor) {
 
     	case 0:
