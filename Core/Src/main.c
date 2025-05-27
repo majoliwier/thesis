@@ -46,6 +46,8 @@
 /* Private variables ---------------------------------------------------------*/
 CRC_HandleTypeDef hcrc;
 
+DAC_HandleTypeDef hdac;
+
 DMA2D_HandleTypeDef hdma2d;
 
 I2C_HandleTypeDef hi2c3;
@@ -55,6 +57,7 @@ LTDC_HandleTypeDef hltdc;
 SPI_HandleTypeDef hspi5;
 
 TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim7;
 
 UART_HandleTypeDef huart1;
 
@@ -62,7 +65,7 @@ SDRAM_HandleTypeDef hsdram1;
 
 osThreadId defaultTaskHandle;
 /* USER CODE BEGIN PV */
-
+osThreadId myTaskHandle;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -76,6 +79,8 @@ static void MX_LTDC_Init(void);
 static void MX_SPI5_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_TIM7_Init(void);
+static void MX_DAC_Init(void);
 void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
@@ -114,7 +119,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     }
 }
 
-
+void myStartDefaultTask(void const * argument);
 /* USER CODE END 0 */
 
 /**
@@ -155,6 +160,8 @@ int main(void)
   MX_SPI5_Init();
   MX_TIM1_Init();
   MX_USART1_UART_Init();
+  MX_TIM7_Init();
+  MX_DAC_Init();
   /* USER CODE BEGIN 2 */
 //  printf("Starting sensor...\r\n");
 //      if (BoodOxy_Init_I2C(&hi2c3, 0x57)) {
@@ -189,6 +196,8 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
+  osThreadDef(myTask, myStartDefaultTask, osPriorityLow, 0, 512);
+  myTaskHandle = osThreadCreate(osThread(myTask), NULL);
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
@@ -275,6 +284,46 @@ static void MX_CRC_Init(void)
   /* USER CODE BEGIN CRC_Init 2 */
 
   /* USER CODE END CRC_Init 2 */
+
+}
+
+/**
+  * @brief DAC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_DAC_Init(void)
+{
+
+  /* USER CODE BEGIN DAC_Init 0 */
+
+  /* USER CODE END DAC_Init 0 */
+
+  DAC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN DAC_Init 1 */
+
+  /* USER CODE END DAC_Init 1 */
+
+  /** DAC Initialization
+  */
+  hdac.Instance = DAC;
+  if (HAL_DAC_Init(&hdac) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** DAC channel OUT2 config
+  */
+  sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
+  sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
+  if (HAL_DAC_ConfigChannel(&hdac, &sConfig, DAC_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN DAC_Init 2 */
+
+  /* USER CODE END DAC_Init 2 */
 
 }
 
@@ -510,6 +559,44 @@ static void MX_TIM1_Init(void)
 }
 
 /**
+  * @brief TIM7 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM7_Init(void)
+{
+
+  /* USER CODE BEGIN TIM7_Init 0 */
+
+  /* USER CODE END TIM7_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM7_Init 1 */
+
+  /* USER CODE END TIM7_Init 1 */
+  htim7.Instance = TIM7;
+  htim7.Init.Prescaler = 0;
+  htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim7.Init.Period = 65535;
+  htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim7) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim7, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM7_Init 2 */
+
+  /* USER CODE END TIM7_Init 2 */
+
+}
+
+/**
   * @brief USART1 Initialization Function
   * @param None
   * @retval None
@@ -691,19 +778,8 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
-/* USER CODE END 4 */
-
-/* USER CODE BEGIN Header_StartDefaultTask */
-/**
-  * @brief  Function implementing the defaultTask thread.
-  * @param  argument: Not used
-  * @retval None
-  */
-/* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void const * argument)
+void myStartDefaultTask(void const * argument)
 {
-    MX_USB_HOST_Init();
 
     // Print board startup message
     printf("Board powering on and starting tasks\r\n");
@@ -724,9 +800,6 @@ void StartDefaultTask(void const * argument)
 
 
     for (;;) {
-//    	uint8_t btn = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0);
-//    	printf("PA0: %d\r\n", btn);
-//    	HAL_Delay(500);
     	switch (currentSensor) {
 
     	case 0:
@@ -756,6 +829,28 @@ void StartDefaultTask(void const * argument)
         osDelay(5000);
     }
 }
+/* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+  * @brief  Function implementing the defaultTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void const * argument)
+{
+  /* init code for USB_HOST */
+  MX_USB_HOST_Init();
+  /* USER CODE BEGIN 5 */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END 5 */
+}
+
 /**
   * @brief  Period elapsed callback in non blocking mode
   * @note   This function is called  when TIM6 interrupt took place, inside
