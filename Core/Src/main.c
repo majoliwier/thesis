@@ -24,6 +24,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <string.h>
 #include "dfrobot_bloodoxygen.h"
 #include "dfrobot_mlx90614.h"
 /* USER CODE END Includes */
@@ -59,12 +60,14 @@ SPI_HandleTypeDef hspi5;
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim7;
 
+UART_HandleTypeDef huart5;
 UART_HandleTypeDef huart1;
 
 SDRAM_HandleTypeDef hsdram1;
 
 osThreadId defaultTaskHandle;
 /* USER CODE BEGIN PV */
+uint32_t rtc_base_time = 0;
 osThreadId myTaskHandle;
 /* USER CODE END PV */
 
@@ -81,6 +84,7 @@ static void MX_TIM1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM7_Init(void);
 static void MX_DAC_Init(void);
+static void MX_UART5_Init(void);
 void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
@@ -162,6 +166,7 @@ int main(void)
   MX_USART1_UART_Init();
   MX_TIM7_Init();
   MX_DAC_Init();
+  MX_UART5_Init();
   /* USER CODE BEGIN 2 */
 //  printf("Starting sensor...\r\n");
 //      if (BoodOxy_Init_I2C(&hi2c3, 0x57)) {
@@ -597,6 +602,39 @@ static void MX_TIM7_Init(void)
 }
 
 /**
+  * @brief UART5 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_UART5_Init(void)
+{
+
+  /* USER CODE BEGIN UART5_Init 0 */
+
+  /* USER CODE END UART5_Init 0 */
+
+  /* USER CODE BEGIN UART5_Init 1 */
+
+  /* USER CODE END UART5_Init 1 */
+  huart5.Instance = UART5;
+  huart5.Init.BaudRate = 9600;
+  huart5.Init.WordLength = UART_WORDLENGTH_8B;
+  huart5.Init.StopBits = UART_STOPBITS_1;
+  huart5.Init.Parity = UART_PARITY_NONE;
+  huart5.Init.Mode = UART_MODE_TX_RX;
+  huart5.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart5.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN UART5_Init 2 */
+
+  /* USER CODE END UART5_Init 2 */
+
+}
+
+/**
   * @brief USART1 Initialization Function
   * @param None
   * @retval None
@@ -778,8 +816,52 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+void RequestRTCfromESP32(void)
+{
+    const char* request = "GET_RTC\n";
+    uint8_t rxBuffer[64] = {0};
+    uint8_t ch;
+    int idx = 0;
+
+    // Wyślij żądanie
+    HAL_UART_Transmit(&huart5, (uint8_t*)request, strlen(request), HAL_MAX_DELAY);
+    printf("Requesting RTC from ESP32...\r\n");
+
+    // Czytaj znak po znaku aż do \n lub timeout
+    uint32_t start = HAL_GetTick();
+    while ((HAL_GetTick() - start) < 5000 && idx < sizeof(rxBuffer) - 1) {
+        if (HAL_UART_Receive(&huart5, &ch, 1, 100) == HAL_OK) {
+            rxBuffer[idx++] = ch;
+            if (ch == '\n') break;
+        }
+    }
+
+    rxBuffer[idx] = '\0';  // null-terminate
+
+    if (idx > 0) {
+    	printf("Received raw bytes: ");
+    	for (int i = 0; i < idx; i++) {
+    	    printf("[%02X]", rxBuffer[i]);
+    	}
+    	printf("\r\n");
+        char *ptr = strstr((char*)rxBuffer, "\"rtc\":");
+        if (ptr) {
+            rtc_base_time = atoi(ptr + 6);
+            printf("RTC base time received: %lu\r\n", rtc_base_time);
+        } else {
+            printf("RTC format invalid.\r\n");
+        }
+    } else {
+        printf("Timeout: no response from ESP32.\r\n");
+    }
+}
+
 void myStartDefaultTask(void const * argument)
 {
+    const char* hello = "HELLO STM32 UART5\r\n";
+    HAL_UART_Transmit(&huart5, (uint8_t*)hello, strlen(hello), HAL_MAX_DELAY);
+    RequestRTCfromESP32();
 
     // Print board startup message
     printf("Board powering on and starting tasks\r\n");
@@ -798,27 +880,35 @@ void myStartDefaultTask(void const * argument)
         printf("BloodOxy sensor not found\r\n");
     }
 
-
+    char uart5Msg[64];
     for (;;) {
     	switch (currentSensor) {
 
     	case 0:
         // Read ambient temperature
-        if (MLX90614_ReadAmbientTemp(&mlxData.ambient) == HAL_OK)
-            printf("Ambient: %.2f C\r\n", mlxData.ambient);
-        else
-            printf("Ambient read error\r\n");
+        if (MLX90614_ReadAmbientTemp(&mlxData.ambient) == HAL_OK){
+        	uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
+            printf("Timestamp: %lu,Ambient: %.2f C\, Object: %.2f C\r\n",timestamp,  mlxData.ambient, mlxData.object);
 
-        // Read object temperature
-        if (MLX90614_ReadObjectTemp(&mlxData.object) == HAL_OK)
-            printf("Object: %.2f C\r\n", mlxData.object);
+            snprintf(uart5Msg, sizeof(uart5Msg),
+                     "{\"timestamp\":%lu,\"ambient\":%.2f,\"object\":%.2f}\r\n",
+                     timestamp, mlxData.ambient, mlxData.object);
+            HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+        }
         else
-            printf("Object read error\r\n");
+            printf("Temperature read error\r\n");
         break;
+
     	case 1:
+
         // Read SpO2 and heart rate
         if (BoodOxy_GetHeartbeatSPO2(&oxyData) == HAL_OK) {
-            printf("SpO2: %d%%, HR: %ld bpm\r\n", oxyData.spo2, oxyData.heartbeat);
+            uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
+            printf("Timestamp: %lu,SpO2: %d%%, HR: %ld bpm\r\n", timestamp, oxyData.spo2, oxyData.heartbeat);
+            snprintf(uart5Msg, sizeof(uart5Msg),
+                     "{\"timestamp\":%lu,\"spo2\":%d,\"hr\":%ld}\r\n",
+                     timestamp, oxyData.spo2, oxyData.heartbeat);
+			HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
         } else {
             printf("BloodOxy read error\r\n");
         }
