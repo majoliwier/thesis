@@ -36,7 +36,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define MAX_RETRIES 3
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -88,7 +88,8 @@ static void MX_UART5_Init(void);
 void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
-
+uint8_t calcChecksum(const char* str, size_t len);
+bool waitForAck(UART_HandleTypeDef* uart, uint32_t timeout_ms);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -828,6 +829,11 @@ void RequestRTCfromESP32(void)
     HAL_UART_Transmit(&huart5, (uint8_t*)request, strlen(request), HAL_MAX_DELAY);
     printf("Requesting RTC from ESP32...\r\n");
 
+    uint8_t dump;
+    while (HAL_UART_Receive(&huart5, &dump, 1, 5) == HAL_OK);
+
+    osDelay(100);
+
     // Czytaj znak po znaku aż do \n lub timeout
     uint32_t start = HAL_GetTick();
     while ((HAL_GetTick() - start) < 5000 && idx < sizeof(rxBuffer) - 1) {
@@ -847,8 +853,11 @@ void RequestRTCfromESP32(void)
     	printf("\r\n");
         char *ptr = strstr((char*)rxBuffer, "\"rtc\":");
         if (ptr) {
+        	const char* ack = "ACK\r\n";
+			HAL_UART_Transmit(&huart5, (uint8_t*)ack, strlen(ack), HAL_MAX_DELAY);
             rtc_base_time = atoi(ptr + 6);
             printf("RTC base time received: %lu\r\n", rtc_base_time);
+
         } else {
             printf("RTC format invalid.\r\n");
         }
@@ -859,8 +868,10 @@ void RequestRTCfromESP32(void)
 
 void myStartDefaultTask(void const * argument)
 {
+	osDelay(1000);
     const char* hello = "HELLO STM32 UART5\r\n";
     HAL_UART_Transmit(&huart5, (uint8_t*)hello, strlen(hello), HAL_MAX_DELAY);
+    osDelay(200);
     RequestRTCfromESP32();
 
     // Print board startup message
@@ -880,44 +891,121 @@ void myStartDefaultTask(void const * argument)
         printf("BloodOxy sensor not found\r\n");
     }
 
-    char uart5Msg[64];
+    char uart5Msg[128];
     for (;;) {
     	switch (currentSensor) {
 
     	case 0:
         // Read ambient temperature
-        if (MLX90614_ReadAmbientTemp(&mlxData.ambient) == HAL_OK){
-        	uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
-            printf("Timestamp: %lu,Ambient: %.2f C\, Object: %.2f C\r\n",timestamp,  mlxData.ambient, mlxData.object);
+    		if (MLX90614_ReadAmbientTemp(&mlxData.ambient) == HAL_OK) {
+    		    if (MLX90614_ReadObjectTemp(&mlxData.object) != HAL_OK) {
+    		        printf("MLX90614 object read failed\r\n");
+    		        mlxData.object = 0.0f;
+    		    }
+        uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
 
-            snprintf(uart5Msg, sizeof(uart5Msg),
-                     "{\"timestamp\":%lu,\"ambient\":%.2f,\"object\":%.2f}\r\n",
-                     timestamp, mlxData.ambient, mlxData.object);
-            HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+        char payload[64];
+        snprintf(payload, sizeof(payload),
+             "{\"timestamp\":%lu,\"ambient\":%.2f,\"object\":%.2f}",
+             timestamp, mlxData.ambient, mlxData.object);
+
+    uint8_t crc = calcChecksum(payload, strlen(payload));
+    printf("Timestamp: %lu, Ambient: %.2f C, Object: %.2f C, CRC: %d\r\n",timestamp,  mlxData.ambient, mlxData.object, crc);
+
+    snprintf(uart5Msg, sizeof(uart5Msg),
+             "%s,\"crc\":%d}\r\n", payload, crc);
+
+    HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    	if (attempt == 0) osDelay(10);
+        HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+        printf("Sent (try %d): %s", attempt + 1, uart5Msg);
+
+        if (waitForAck(&huart5, 500)) {
+            printf("ACK received\r\n\n");
+            break;
+        } else {
+            printf("NACK or no response — retrying...\r\n");
+        }
+    }
+
+
         }
         else
             printf("Temperature read error\r\n");
         break;
 
     	case 1:
+    	    if (BoodOxy_GetHeartbeatSPO2(&oxyData) == HAL_OK) {
+    	        uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
+    	        char payload[64];
+    	        snprintf(payload, sizeof(payload),
+    	                 "{\"timestamp\":%lu,\"spo2\":%d,\"hr\":%ld}",
+    	                 timestamp, oxyData.spo2, oxyData.heartbeat);
 
-        // Read SpO2 and heart rate
-        if (BoodOxy_GetHeartbeatSPO2(&oxyData) == HAL_OK) {
-            uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
-            printf("Timestamp: %lu,SpO2: %d%%, HR: %ld bpm\r\n", timestamp, oxyData.spo2, oxyData.heartbeat);
-            snprintf(uart5Msg, sizeof(uart5Msg),
-                     "{\"timestamp\":%lu,\"spo2\":%d,\"hr\":%ld}\r\n",
-                     timestamp, oxyData.spo2, oxyData.heartbeat);
-			HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
-        } else {
-            printf("BloodOxy read error\r\n");
-        }
-        break;
+    	        uint8_t crc = calcChecksum(payload, strlen(payload));
+    	        printf("Timestamp: %lu, SpO2: %d%%, HR: %ld bpm, CRC: %d\r\n", timestamp, oxyData.spo2, oxyData.heartbeat, crc);
+
+    	        snprintf(uart5Msg, sizeof(uart5Msg),
+    	                 "%s,\"crc\":%d}\r\n", payload, crc);
+
+	            HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+    	        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    	            if (attempt == 0) osDelay(10);
+    	            HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+    	            printf("Sent (try %d): %s", attempt + 1, uart5Msg);
+
+    	            if (waitForAck(&huart5, 500)) {
+    	                printf("ACK received\r\n\n");
+    	                break;
+    	            } else {
+    	                printf("NACK or no response — retrying...\r\n");
+    	            }
+    	        }
+    	    } else {
+    	        printf("BloodOxy read error\r\n");
+    	    }
+    	    break;
 
 
     	}
         osDelay(5000);
     }
+}
+
+uint8_t calcChecksum(const char* str, size_t len) {
+    uint8_t sum = 0;
+    for (size_t i = 0; i < len; i++) {
+        sum += (uint8_t)str[i];
+    }
+    return sum;
+}
+
+
+bool waitForAck(UART_HandleTypeDef* uart, uint32_t timeout_ms) {
+    uint8_t dummy;
+    while (HAL_UART_Receive(uart, &dummy, 1, 1) == HAL_OK);
+
+    uint8_t ch;
+    char ackBuf[16] = {0};
+    int idx = 0;
+    uint32_t start = HAL_GetTick();
+
+    while ((HAL_GetTick() - start) < timeout_ms && idx < sizeof(ackBuf) - 1) {
+        if (HAL_UART_Receive(uart, &ch, 1, 10) == HAL_OK) {
+            if (ch == '\r') continue;
+            if (ch == '\n') break;
+            ackBuf[idx++] = ch;
+        }
+    }
+
+    ackBuf[idx] = '\0';
+
+
+    if (strcmp(ackBuf, "ACK") == 0) return true;
+    if (strcmp(ackBuf, "NACK") == 0) return false;
+
+    return false;
 }
 /* USER CODE END 4 */
 
