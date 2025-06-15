@@ -24,6 +24,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "dfrobot_bloodoxygen.h"
 #include "dfrobot_mlx90614.h"
@@ -45,6 +46,8 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+
 CRC_HandleTypeDef hcrc;
 
 DAC_HandleTypeDef hdac;
@@ -85,6 +88,7 @@ static void MX_USART1_UART_Init(void);
 static void MX_TIM7_Init(void);
 static void MX_DAC_Init(void);
 static void MX_UART5_Init(void);
+static void MX_ADC1_Init(void);
 void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
@@ -118,7 +122,7 @@ volatile uint8_t currentSensor = 0;
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == GPIO_PIN_0) {
-        currentSensor = (currentSensor + 1) % 2;
+        currentSensor = (currentSensor + 1) % 3;
         printf("Przycisk wcisniety - aktualny sensor: %d\r\n", currentSensor);
         HAL_GPIO_TogglePin(GPIOG, LD3_Pin);
     }
@@ -168,6 +172,7 @@ int main(void)
   MX_TIM7_Init();
   MX_DAC_Init();
   MX_UART5_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
 //  printf("Starting sensor...\r\n");
 //      if (BoodOxy_Init_I2C(&hi2c3, 0x57)) {
@@ -265,6 +270,58 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_13;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
@@ -933,6 +990,7 @@ void myStartDefaultTask(void const * argument)
         }
         else
             printf("Temperature read error\r\n");
+		osDelay(5000);
         break;
 
     	case 1:
@@ -965,11 +1023,74 @@ void myStartDefaultTask(void const * argument)
     	    } else {
     	        printf("BloodOxy read error\r\n");
     	    }
+    	    osDelay(5000);
     	    break;
+
+        case 2:
+        {
+            // === GSR Sensor (PC3 - ADC1_IN13) ===
+            ADC_ChannelConfTypeDef sConfig = {0};
+            sConfig.Channel = ADC_CHANNEL_13;  // PC3
+            sConfig.Rank = 1;
+            sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
+
+            if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+                Error_Handler();
+            }
+
+            uint32_t gsrSum = 0;
+            for (int i = 0; i < 10; i++) {
+                HAL_ADC_Start(&hadc1);
+                if (HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY) == HAL_OK) {
+                    gsrSum += HAL_ADC_GetValue(&hadc1);
+                }
+            }
+            uint32_t gsrAvg = gsrSum / 10;
+
+            const char* mood = "Unknown";
+            if (gsrAvg < 400) {
+                mood = "Stressed";
+            } else if (gsrAvg >= 400 && gsrAvg <= 1000) {
+                mood = "Neutral";
+            } else {
+                mood = "Relaxed";
+            }
+
+            uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
+
+            char payload[96];
+            snprintf(payload, sizeof(payload),
+                     "{\"timestamp\":%lu,\"gsr\":%lu,\"mood\":\"%s\"}",
+                     timestamp, gsrAvg, mood);
+
+            uint8_t crc = calcChecksum(payload, strlen(payload));
+            snprintf(uart5Msg, sizeof(uart5Msg),
+                     "%s,\"crc\":%d}\r\n", payload, crc);
+
+            printf("Timestamp: %lu, GSR: %lu, Mood: %s, CRC: %d\r\n",
+                   timestamp, gsrAvg, mood, crc);
+
+            HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+
+            for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+                if (attempt == 0) osDelay(10);
+                HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+                printf("Sent (try %d): %s", attempt + 1, uart5Msg);
+
+                if (waitForAck(&huart5, 500)) {
+                    printf("ACK received\r\n\n");
+                    break;
+                } else {
+                    printf("NACK or no response — retrying...\r\n");
+                }
+            }
+        }
+        osDelay(1000);
+        break;
 
 
     	}
-        osDelay(5000);
+
     }
 }
 
