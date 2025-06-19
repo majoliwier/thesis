@@ -72,6 +72,18 @@ osThreadId defaultTaskHandle;
 /* USER CODE BEGIN PV */
 uint32_t rtc_base_time = 0;
 osThreadId myTaskHandle;
+
+// Buffer for blood oxygen sensor
+#define BLOOD_OXY_BUFFER_SIZE 5
+typedef struct {
+    int16_t spo2_values[BLOOD_OXY_BUFFER_SIZE];
+    int32_t hr_values[BLOOD_OXY_BUFFER_SIZE];
+    uint8_t valid_count;
+    int16_t last_valid_spo2;
+    int32_t last_valid_hr;
+} BloodOxyBuffer;
+
+static BloodOxyBuffer bloodOxyBuffer = {0};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -994,37 +1006,82 @@ void myStartDefaultTask(void const * argument)
         break;
 
     	case 1:
-    	    if (BoodOxy_GetHeartbeatSPO2(&oxyData) == HAL_OK) {
-    	        uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
-    	        char payload[64];
-    	        snprintf(payload, sizeof(payload),
-    	                 "{\"timestamp\":%lu,\"spo2\":%d,\"hr\":%ld}",
-    	                 timestamp, oxyData.spo2, oxyData.heartbeat);
-
-    	        uint8_t crc = calcChecksum(payload, strlen(payload));
-    	        printf("Timestamp: %lu, SpO2: %d%%, HR: %ld bpm, CRC: %d\r\n", timestamp, oxyData.spo2, oxyData.heartbeat, crc);
-
-    	        snprintf(uart5Msg, sizeof(uart5Msg),
-    	                 "%s,\"crc\":%d}\r\n", payload, crc);
-
-	            HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
-    	        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    	            if (attempt == 0) osDelay(10);
-    	            HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
-    	            printf("Sent (try %d): %s", attempt + 1, uart5Msg);
-
-    	            if (waitForAck(&huart5, 500)) {
-    	                printf("ACK received\r\n\n");
-    	                break;
-    	            } else {
-    	                printf("NACK or no response — retrying...\r\n");
+    	{
+    	    BoodOxyData tempData;
+    	    if (BoodOxy_GetHeartbeatSPO2(&tempData) == HAL_OK) {
+    	        // Only add valid values to buffer
+    	        if (tempData.spo2 > 0 && tempData.spo2 <= 100 && 
+    	            tempData.heartbeat > 0 && tempData.heartbeat <= 250) {
+    	            
+    	            // Shift buffer
+    	            for (int i = BLOOD_OXY_BUFFER_SIZE - 1; i > 0; i--) {
+    	                bloodOxyBuffer.spo2_values[i] = bloodOxyBuffer.spo2_values[i-1];
+    	                bloodOxyBuffer.hr_values[i] = bloodOxyBuffer.hr_values[i-1];
     	            }
+    	            
+    	            // Add new values
+    	            bloodOxyBuffer.spo2_values[0] = tempData.spo2;
+    	            bloodOxyBuffer.hr_values[0] = tempData.heartbeat;
+    	            
+    	            // Update valid count
+    	            if (bloodOxyBuffer.valid_count < BLOOD_OXY_BUFFER_SIZE) {
+    	                bloodOxyBuffer.valid_count++;
+    	            }
+    	            
+    	            // Update last valid values
+    	            bloodOxyBuffer.last_valid_spo2 = tempData.spo2;
+    	            bloodOxyBuffer.last_valid_hr = tempData.heartbeat;
+    	        }
+    	        
+    	        // Only send data if we have enough valid samples
+    	        if (bloodOxyBuffer.valid_count >= 3) {
+    	            // Calculate average of last 3 values
+    	            int32_t avg_spo2 = 0;
+    	            int32_t avg_hr = 0;
+    	            for (int i = 0; i < 3; i++) {
+    	                avg_spo2 += bloodOxyBuffer.spo2_values[i];
+    	                avg_hr += bloodOxyBuffer.hr_values[i];
+    	            }
+    	            avg_spo2 /= 3;
+    	            avg_hr /= 3;
+    	            
+    	            uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
+    	            char payload[64];
+    	            snprintf(payload, sizeof(payload),
+    	                    "{\"timestamp\":%lu,\"spo2\":%ld,\"hr\":%ld}",
+    	                    timestamp, avg_spo2, avg_hr);
+    	            
+    	            uint8_t crc = calcChecksum(payload, strlen(payload));
+    	            printf("Timestamp: %lu, SpO2: %ld%%, HR: %ld bpm, CRC: %d\r\n", 
+    	                   timestamp, avg_spo2, avg_hr, crc);
+    	            
+    	            snprintf(uart5Msg, sizeof(uart5Msg),
+    	                    "%s,\"crc\":%d}\r\n", payload, crc);
+    	            
+    	            HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+    	            for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    	                if (attempt == 0) osDelay(10);
+    	                HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+    	                printf("Sent (try %d): %s", attempt + 1, uart5Msg);
+    	                
+    	                if (waitForAck(&huart5, 500)) {
+    	                    printf("ACK received\r\n\n");
+    	                    break;
+    	                } else {
+    	                    printf("NACK or no response — retrying...\r\n");
+    	                }
+    	            }
+    	            osDelay(5000); // Normal delay after sending data
+    	        } else {
+    	            printf("Waiting for more valid samples (%d/3)...\r\n", bloodOxyBuffer.valid_count);
+    	            osDelay(1000); // Shorter delay while collecting samples
     	        }
     	    } else {
     	        printf("BloodOxy read error\r\n");
+    	        osDelay(1000); // Error delay
     	    }
-    	    osDelay(5000);
     	    break;
+    	}
 
         case 2:
         {
