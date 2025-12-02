@@ -28,6 +28,9 @@
 #include <string.h>
 #include "dfrobot_bloodoxygen.h"
 #include "dfrobot_mlx90614.h"
+#include "stm32f429i_discovery.h"
+#include "stm32f429i_discovery_lcd.h"
+#include "stm32f429i_discovery_ts.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -38,6 +41,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define MAX_RETRIES 3
+#define LCD_FB_START_ADDRESS 0xD0000000
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -72,6 +76,12 @@ osThreadId defaultTaskHandle;
 /* USER CODE BEGIN PV */
 uint32_t rtc_base_time = 0;
 osThreadId myTaskHandle;
+osThreadId touchTaskHandle;
+osThreadId renderTaskHandle;
+
+uint16_t lcdWidth  = 0;
+uint16_t lcdHeight = 0;
+
 
 // Buffer for blood oxygen sensor
 #define BLOOD_OXY_BUFFER_SIZE 5
@@ -106,6 +116,9 @@ void StartDefaultTask(void const * argument);
 /* USER CODE BEGIN PFP */
 uint8_t calcChecksum(const char* str, size_t len);
 bool waitForAck(UART_HandleTypeDef* uart, uint32_t timeout_ms);
+
+void StartTouchTask(void const * argument);
+void StartRenderTask(void const * argument);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -127,9 +140,74 @@ int fputc(int ch, FILE *f)
 #endif
 
 
-static BoodOxyData   oxyData;
-static MLX90614_Data mlxData;
+
 volatile uint8_t currentSensor = 0;
+
+extern uint32_t rtc_base_time;
+
+
+MLX90614_Data mlxData;
+BoodOxyData oxyData;
+extern uint16_t lcdHeight;
+
+
+
+void RenderSensorDataToLCD(void)
+{
+    BSP_LCD_Clear(LCD_COLOR_BLACK);
+    BSP_LCD_SetBackColor(LCD_COLOR_BLACK);
+    BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+
+    char buf[64];
+
+    switch (currentSensor)
+    {
+    case 0:
+        BSP_LCD_DisplayStringAt(0, 20, (uint8_t *)"TEMPERATURA", CENTER_MODE);
+
+        snprintf(buf, sizeof(buf), "Ambient: %.2f C", mlxData.ambient);
+        BSP_LCD_DisplayStringAt(0, 50, (uint8_t*)buf, CENTER_MODE);
+
+        snprintf(buf, sizeof(buf), "Object : %.2f C", mlxData.object);
+        BSP_LCD_DisplayStringAt(0, 70, (uint8_t*)buf, CENTER_MODE);
+        break;
+
+    case 1:
+        BSP_LCD_DisplayStringAt(0, 20, (uint8_t *)"PULSOKSYMETR", CENTER_MODE);
+
+        snprintf(buf, sizeof(buf), "SpO2 : %d %%", oxyData.spo2);
+        BSP_LCD_DisplayStringAt(0, 50, (uint8_t*)buf, CENTER_MODE);
+
+        snprintf(buf, sizeof(buf), "HR   : %ld bpm", oxyData.heartbeat);
+        BSP_LCD_DisplayStringAt(0, 70, (uint8_t*)buf, CENTER_MODE);
+        break;
+
+    case 2:
+        BSP_LCD_DisplayStringAt(0, 20, (uint8_t *)"GSR", CENTER_MODE);
+
+        snprintf(buf, sizeof(buf), "GSR not shown");
+        BSP_LCD_DisplayStringAt(0, 50, (uint8_t*)buf, CENTER_MODE);
+        break;
+
+    default:
+        BSP_LCD_DisplayStringAt(0, 50, (uint8_t*)"Invalid sensor", CENTER_MODE);
+        break;
+    }
+}
+void StartRenderTask(void const * argument)
+{
+    printf("Render task START\r\n");
+    osDelay(3000);
+
+    while (1)
+    {
+
+        RenderSensorDataToLCD();
+
+        osDelay(500);
+    }
+}
+
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
@@ -168,7 +246,10 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
+  HAL_GPIO_WritePin(ACP_RST_GPIO_Port, ACP_RST_Pin, GPIO_PIN_RESET);
+  HAL_Delay(20);
+  HAL_GPIO_WritePin(ACP_RST_GPIO_Port, ACP_RST_Pin, GPIO_PIN_SET);
+  HAL_Delay(20);
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -186,13 +267,108 @@ int main(void)
   MX_UART5_Init();
   MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
-//  printf("Starting sensor...\r\n");
-//      if (BoodOxy_Init_I2C(&hi2c3, 0x57)) {
-//          printf("Sensor ready!\r\n");
-//          BoodOxy_SensorStartCollect();
-//      } else {
-//          printf("Sensor not found.\r\n");
-//      }
+  #define LCD_FRAMEBUFFER       ((uint32_t)0xD0000000)
+  #define LCD_WIDTH             240
+  #define LCD_HEIGHT            320
+
+  #define COLOR_BLACK           0x0000
+  #define COLOR_WHITE           0xFFFF
+  #define COLOR_GREEN           0x07E0
+
+  LTDC_LayerCfgTypeDef pLayerCfg = {0};
+
+ 
+
+  hltdc.Instance = LTDC;
+  hltdc.Init.HSPolarity        = LTDC_HSPOLARITY_AL;
+  hltdc.Init.VSPolarity        = LTDC_VSPOLARITY_AL;
+  hltdc.Init.DEPolarity        = LTDC_DEPOLARITY_AL;
+  hltdc.Init.PCPolarity        = LTDC_PCPOLARITY_IPC;
+  hltdc.Init.HorizontalSync    = 9;
+  hltdc.Init.VerticalSync      = 1;
+  hltdc.Init.AccumulatedHBP    = 29;
+  hltdc.Init.AccumulatedVBP    = 3;
+  hltdc.Init.AccumulatedActiveW = 269;
+  hltdc.Init.AccumulatedActiveH = 323;
+  hltdc.Init.TotalWidth        = 279;
+  hltdc.Init.TotalHeigh        = 327;
+  hltdc.Init.Backcolor.Blue    = 0;
+  hltdc.Init.Backcolor.Green   = 0;
+  hltdc.Init.Backcolor.Red     = 0;
+
+  RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
+  PeriphClkInitStruct.PeriphClockSelection    = RCC_PERIPHCLK_LTDC;
+  PeriphClkInitStruct.PLLSAI.PLLSAIN          = 192;
+  PeriphClkInitStruct.PLLSAI.PLLSAIR          = 4;
+  PeriphClkInitStruct.PLLSAIDivR              = RCC_PLLSAIDIVR_8;
+  HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct);
+
+  BSP_LCD_MspInit();
+
+  HAL_LTDC_Init(&hltdc);
+
+  ili9341_Init();
+
+  BSP_SDRAM_Init();
+
+  pLayerCfg.WindowX0        = 0;
+  pLayerCfg.WindowX1        = LCD_WIDTH;
+  pLayerCfg.WindowY0        = 0;
+  pLayerCfg.WindowY1        = LCD_HEIGHT;
+  pLayerCfg.PixelFormat     = LTDC_PIXEL_FORMAT_RGB565;
+  pLayerCfg.Alpha           = 255;
+  pLayerCfg.Alpha0          = 0;
+  pLayerCfg.BlendingFactor1 = LTDC_BLENDING_FACTOR1_PAxCA;
+  pLayerCfg.BlendingFactor2 = LTDC_BLENDING_FACTOR2_PAxCA;
+  pLayerCfg.FBStartAdress   = LCD_FRAMEBUFFER;
+  pLayerCfg.ImageWidth      = LCD_WIDTH;
+  pLayerCfg.ImageHeight     = LCD_HEIGHT;
+  pLayerCfg.Backcolor.Blue  = 0;
+  pLayerCfg.Backcolor.Green = 0;
+  pLayerCfg.Backcolor.Red   = 0;
+  HAL_LTDC_ConfigLayer(&hltdc, &pLayerCfg, 0);
+
+  ili9341_DisplayOn();
+  HAL_Delay(100);
+
+  uint16_t *framebuffer = (uint16_t*)LCD_FRAMEBUFFER;
+  for (uint32_t i = 0; i < (LCD_WIDTH * LCD_HEIGHT); ++i) {
+      framebuffer[i] = COLOR_BLACK;
+  }
+  HAL_Delay(50);
+
+  lcdWidth  = LCD_WIDTH;
+  lcdHeight = LCD_HEIGHT;
+  printf("LCD: %u x %u\r\n", lcdWidth, lcdHeight);
+
+  for (uint16_t y = 80; y < 80 + 60; ++y) {
+      for (uint16_t x = 20; x < 20 + 200; ++x) {
+          framebuffer[y * LCD_WIDTH + x] = COLOR_GREEN;
+      }
+  }
+
+  if (BSP_TS_Init(lcdWidth, lcdHeight) == TS_OK) {
+      printf("TS init OK\r\n");
+  } else {
+      printf("TS init ERROR\r\n");
+  }
+
+
+  BSP_LCD_Init();
+
+  BSP_LCD_LayerDefaultInit(0, LCD_FRAMEBUFFER);
+
+  BSP_LCD_SelectLayer(0);
+
+  BSP_LCD_SetBackColor(LCD_COLOR_BLACK);
+  BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+  BSP_LCD_SetFont(&Font16);
+
+  HAL_Delay(10000);
+
+  BSP_LCD_Clear(LCD_COLOR_BLACK);
+
+  BSP_LCD_DisplayStringAt(0, 20, (uint8_t *)"BSP TEXT TEST", CENTER_MODE);
 
   /* USER CODE END 2 */
 
@@ -214,13 +390,20 @@ int main(void)
 
   /* Create the thread(s) */
   /* definition and creation of defaultTask */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 4096);
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 512);
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
-  osThreadDef(myTask, myStartDefaultTask, osPriorityLow, 0, 512);
+  osThreadDef(myTask, myStartDefaultTask, osPriorityLow, 0, 4096);
   myTaskHandle = osThreadCreate(osThread(myTask), NULL);
+
+
+  osThreadDef(touchTask, StartTouchTask, osPriorityLow, 0, 2048);
+  touchTaskHandle = osThreadCreate(osThread(touchTask), NULL);
+
+  osThreadDef(renderTask, StartRenderTask, osPriorityBelowNormal, 0, 512);
+  renderTaskHandle = osThreadCreate(osThread(renderTask), NULL);
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
@@ -251,7 +434,7 @@ void SystemClock_Config(void)
   /** Configure the main internal regulator output voltage
   */
   __HAL_RCC_PWR_CLK_ENABLE();
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -261,9 +444,9 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = 4;
-  RCC_OscInitStruct.PLL.PLLN = 72;
+  RCC_OscInitStruct.PLL.PLLN = 168;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 3;
+  RCC_OscInitStruct.PLL.PLLQ = 7;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -275,10 +458,10 @@ void SystemClock_Config(void)
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
   {
     Error_Handler();
   }
@@ -305,7 +488,7 @@ static void MX_ADC1_Init(void)
   /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
   */
   hadc1.Instance = ADC1;
-  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
   hadc1.Init.ScanConvMode = DISABLE;
   hadc1.Init.ContinuousConvMode = DISABLE;
@@ -509,9 +692,9 @@ static void MX_LTDC_Init(void)
   hltdc.Init.VSPolarity = LTDC_VSPOLARITY_AL;
   hltdc.Init.DEPolarity = LTDC_DEPOLARITY_AL;
   hltdc.Init.PCPolarity = LTDC_PCPOLARITY_IPC;
-  hltdc.Init.HorizontalSync = 9;
-  hltdc.Init.VerticalSync = 1;
-  hltdc.Init.AccumulatedHBP = 29;
+  hltdc.Init.HorizontalSync = 8;
+  hltdc.Init.VerticalSync = 0;
+  hltdc.Init.AccumulatedHBP = 37;
   hltdc.Init.AccumulatedVBP = 3;
   hltdc.Init.AccumulatedActiveW = 269;
   hltdc.Init.AccumulatedActiveH = 323;
@@ -525,9 +708,9 @@ static void MX_LTDC_Init(void)
     Error_Handler();
   }
   pLayerCfg.WindowX0 = 0;
-  pLayerCfg.WindowX1 = 240;
+  pLayerCfg.WindowX1 = 239;
   pLayerCfg.WindowY0 = 0;
-  pLayerCfg.WindowY1 = 320;
+  pLayerCfg.WindowY1 = 319;
   pLayerCfg.PixelFormat = LTDC_PIXEL_FORMAT_RGB565;
   pLayerCfg.Alpha = 255;
   pLayerCfg.Alpha0 = 0;
@@ -887,6 +1070,34 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+void StartTouchTask(void const * argument)
+{
+    TS_StateTypeDef ts;
+    uint8_t lastTouch = 0;
+
+    printf("Touch task started\r\n");
+    osDelay(200);
+
+    for (;;)
+    {
+        BSP_TS_GetState(&ts);
+
+        if (ts.TouchDetected && !lastTouch)
+        {
+            uint16_t x = ts.X;
+            uint16_t y = ts.Y;
+
+            printf("Touch: X=%u Y=%u\r\n", x, y);
+            currentSensor = (currentSensor + 1) % 3;
+            printf("Sensor changed to %d\r\n", currentSensor);
+        }
+
+        lastTouch = ts.TouchDetected ? 1 : 0;
+
+        osDelay(50);
+    }
+}
+
 void RequestRTCfromESP32(void)
 {
     const char* request = "GET_RTC\n";
@@ -937,16 +1148,14 @@ void RequestRTCfromESP32(void)
 
 void myStartDefaultTask(void const * argument)
 {
-	osDelay(1000);
+    osDelay(1000);
     const char* hello = "HELLO STM32 UART5\r\n";
     HAL_UART_Transmit(&huart5, (uint8_t*)hello, strlen(hello), HAL_MAX_DELAY);
     osDelay(200);
     RequestRTCfromESP32();
 
-    // Print board startup message
     printf("Board powering on and starting tasks\r\n");
 
-    // Initialize sensors once
     if (MLX90614_Init_I2C(&hi2c3, 0x5A)) {
         printf("MLX90614 sensor ready\r\n");
     } else {
@@ -962,132 +1171,124 @@ void myStartDefaultTask(void const * argument)
 
     char uart5Msg[128];
     for (;;) {
-    	switch (currentSensor) {
+        switch (currentSensor) {
 
-    	case 0:
-        // Read ambient temperature
-    		if (MLX90614_ReadAmbientTemp(&mlxData.ambient) == HAL_OK) {
-    		    if (MLX90614_ReadObjectTemp(&mlxData.object) != HAL_OK) {
-    		        printf("MLX90614 object read failed\r\n");
-    		        mlxData.object = 0.0f;
-    		    }
-        uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
+        case 0:
+            if (MLX90614_ReadAmbientTemp(&mlxData.ambient) == HAL_OK) {
+                if (MLX90614_ReadObjectTemp(&mlxData.object) != HAL_OK) {
+                    printf("MLX90614 object read failed\r\n");
+                    mlxData.object = 0.0f;
+                }
 
-        char payload[64];
-        snprintf(payload, sizeof(payload),
-             "{\"timestamp\":%lu,\"ambient\":%.2f,\"object\":%.2f}",
-             timestamp, mlxData.ambient, mlxData.object);
+                uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
+                char payload[64];
+                snprintf(payload, sizeof(payload),
+                         "{\"timestamp\":%lu,\"ambient\":%.2f,\"object\":%.2f}",
+                         timestamp, mlxData.ambient, mlxData.object);
 
-    uint8_t crc = calcChecksum(payload, strlen(payload));
-    printf("Timestamp: %lu, Ambient: %.2f C, Object: %.2f C, CRC: %d\r\n",timestamp,  mlxData.ambient, mlxData.object, crc);
+                uint8_t crc = calcChecksum(payload, strlen(payload));
+                printf("Timestamp: %lu, Ambient: %.2f C, Object: %.2f C, CRC: %d\r\n",
+                       timestamp, mlxData.ambient, mlxData.object, crc);
 
-    snprintf(uart5Msg, sizeof(uart5Msg),
-             "%s,\"crc\":%d}\r\n", payload, crc);
+                snprintf(uart5Msg, sizeof(uart5Msg),
+                         "%s,\"crc\":%d}\r\n", payload, crc);
 
-    HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
-    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    	if (attempt == 0) osDelay(10);
-        HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
-        printf("Sent (try %d): %s", attempt + 1, uart5Msg);
+                HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+                for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+                    if (attempt == 0) osDelay(10);
+                    HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+                    printf("Sent (try %d): %s", attempt + 1, uart5Msg);
 
-        if (waitForAck(&huart5, 500)) {
-            printf("ACK received\r\n\n");
+                    if (waitForAck(&huart5, 500)) {
+                        printf("ACK received\r\n\n");
+                        break;
+                    } else {
+                        printf("NACK or no response — retrying...\r\n");
+                    }
+                }
+            } else {
+                printf("Temperature read error\r\n");
+            }
+            osDelay(5000);
             break;
-        } else {
-            printf("NACK or no response — retrying...\r\n");
+
+        case 1:
+        {
+            BoodOxyData tempData;
+            if (BoodOxy_GetHeartbeatSPO2(&tempData) == HAL_OK) {
+                oxyData = tempData;
+
+                if (tempData.spo2 > 0 && tempData.spo2 <= 100 &&
+                    tempData.heartbeat > 0 && tempData.heartbeat <= 250) {
+
+                    for (int i = BLOOD_OXY_BUFFER_SIZE - 1; i > 0; i--) {
+                        bloodOxyBuffer.spo2_values[i] = bloodOxyBuffer.spo2_values[i-1];
+                        bloodOxyBuffer.hr_values[i] = bloodOxyBuffer.hr_values[i-1];
+                    }
+
+                    bloodOxyBuffer.spo2_values[0] = tempData.spo2;
+                    bloodOxyBuffer.hr_values[0] = tempData.heartbeat;
+
+                    if (bloodOxyBuffer.valid_count < BLOOD_OXY_BUFFER_SIZE) {
+                        bloodOxyBuffer.valid_count++;
+                    }
+
+                    bloodOxyBuffer.last_valid_spo2 = tempData.spo2;
+                    bloodOxyBuffer.last_valid_hr = tempData.heartbeat;
+                }
+
+                if (bloodOxyBuffer.valid_count >= 3) {
+                    int32_t avg_spo2 = 0;
+                    int32_t avg_hr = 0;
+                    for (int i = 0; i < 3; i++) {
+                        avg_spo2 += bloodOxyBuffer.spo2_values[i];
+                        avg_hr += bloodOxyBuffer.hr_values[i];
+                    }
+                    avg_spo2 /= 3;
+                    avg_hr /= 3;
+
+                    uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
+                    char payload[64];
+                    snprintf(payload, sizeof(payload),
+                             "{\"timestamp\":%lu,\"spo2\":%ld,\"hr\":%ld}",
+                             timestamp, avg_spo2, avg_hr);
+
+                    uint8_t crc = calcChecksum(payload, strlen(payload));
+                    printf("Timestamp: %lu, SpO2: %ld%%, HR: %ld bpm, CRC: %d\r\n",
+                           timestamp, avg_spo2, avg_hr, crc);
+
+                    snprintf(uart5Msg, sizeof(uart5Msg),
+                             "%s,\"crc\":%d}\r\n", payload, crc);
+
+                    HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+                    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+                        if (attempt == 0) osDelay(10);
+                        HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+                        printf("Sent (try %d): %s", attempt + 1, uart5Msg);
+
+                        if (waitForAck(&huart5, 500)) {
+                            printf("ACK received\r\n\n");
+                            break;
+                        } else {
+                            printf("NACK or no response — retrying...\r\n");
+                        }
+                    }
+                    osDelay(5000);
+                } else {
+                    printf("Waiting for more valid samples (%d/3)...\r\n", bloodOxyBuffer.valid_count);
+                    osDelay(1000);
+                }
+            } else {
+                printf("BloodOxy read error\r\n");
+                osDelay(1000);
+            }
+            break;
         }
-    }
-
-
-        }
-        else
-            printf("Temperature read error\r\n");
-		osDelay(5000);
-        break;
-
-    	case 1:
-    	{
-    	    BoodOxyData tempData;
-    	    if (BoodOxy_GetHeartbeatSPO2(&tempData) == HAL_OK) {
-    	        // Only add valid values to buffer
-    	        if (tempData.spo2 > 0 && tempData.spo2 <= 100 && 
-    	            tempData.heartbeat > 0 && tempData.heartbeat <= 250) {
-    	            
-    	            // Shift buffer
-    	            for (int i = BLOOD_OXY_BUFFER_SIZE - 1; i > 0; i--) {
-    	                bloodOxyBuffer.spo2_values[i] = bloodOxyBuffer.spo2_values[i-1];
-    	                bloodOxyBuffer.hr_values[i] = bloodOxyBuffer.hr_values[i-1];
-    	            }
-    	            
-    	            // Add new values
-    	            bloodOxyBuffer.spo2_values[0] = tempData.spo2;
-    	            bloodOxyBuffer.hr_values[0] = tempData.heartbeat;
-    	            
-    	            // Update valid count
-    	            if (bloodOxyBuffer.valid_count < BLOOD_OXY_BUFFER_SIZE) {
-    	                bloodOxyBuffer.valid_count++;
-    	            }
-    	            
-    	            // Update last valid values
-    	            bloodOxyBuffer.last_valid_spo2 = tempData.spo2;
-    	            bloodOxyBuffer.last_valid_hr = tempData.heartbeat;
-    	        }
-    	        
-    	        // Only send data if we have enough valid samples
-    	        if (bloodOxyBuffer.valid_count >= 3) {
-    	            // Calculate average of last 3 values
-    	            int32_t avg_spo2 = 0;
-    	            int32_t avg_hr = 0;
-    	            for (int i = 0; i < 3; i++) {
-    	                avg_spo2 += bloodOxyBuffer.spo2_values[i];
-    	                avg_hr += bloodOxyBuffer.hr_values[i];
-    	            }
-    	            avg_spo2 /= 3;
-    	            avg_hr /= 3;
-    	            
-    	            uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
-    	            char payload[64];
-    	            snprintf(payload, sizeof(payload),
-    	                    "{\"timestamp\":%lu,\"spo2\":%ld,\"hr\":%ld}",
-    	                    timestamp, avg_spo2, avg_hr);
-    	            
-    	            uint8_t crc = calcChecksum(payload, strlen(payload));
-    	            printf("Timestamp: %lu, SpO2: %ld%%, HR: %ld bpm, CRC: %d\r\n", 
-    	                   timestamp, avg_spo2, avg_hr, crc);
-    	            
-    	            snprintf(uart5Msg, sizeof(uart5Msg),
-    	                    "%s,\"crc\":%d}\r\n", payload, crc);
-    	            
-    	            HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
-    	            for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    	                if (attempt == 0) osDelay(10);
-    	                HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
-    	                printf("Sent (try %d): %s", attempt + 1, uart5Msg);
-    	                
-    	                if (waitForAck(&huart5, 500)) {
-    	                    printf("ACK received\r\n\n");
-    	                    break;
-    	                } else {
-    	                    printf("NACK or no response — retrying...\r\n");
-    	                }
-    	            }
-    	            osDelay(5000); // Normal delay after sending data
-    	        } else {
-    	            printf("Waiting for more valid samples (%d/3)...\r\n", bloodOxyBuffer.valid_count);
-    	            osDelay(1000); // Shorter delay while collecting samples
-    	        }
-    	    } else {
-    	        printf("BloodOxy read error\r\n");
-    	        osDelay(1000); // Error delay
-    	    }
-    	    break;
-    	}
 
         case 2:
         {
-            // === GSR Sensor (PC3 - ADC1_IN13) ===
             ADC_ChannelConfTypeDef sConfig = {0};
-            sConfig.Channel = ADC_CHANNEL_13;  // PC3
+            sConfig.Channel = ADC_CHANNEL_13;
             sConfig.Rank = 1;
             sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
 
@@ -1114,15 +1315,13 @@ void myStartDefaultTask(void const * argument)
             }
 
             uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
-
             char payload[96];
             snprintf(payload, sizeof(payload),
                      "{\"timestamp\":%lu,\"gsr\":%lu,\"mood\":\"%s\"}",
                      timestamp, gsrAvg, mood);
 
             uint8_t crc = calcChecksum(payload, strlen(payload));
-            snprintf(uart5Msg, sizeof(uart5Msg),
-                     "%s,\"crc\":%d}\r\n", payload, crc);
+            snprintf(uart5Msg, sizeof(uart5Msg), "%s,\"crc\":%d}\r\n", payload, crc);
 
             printf("Timestamp: %lu, GSR: %lu, Mood: %s, CRC: %d\r\n",
                    timestamp, gsrAvg, mood, crc);
@@ -1144,10 +1343,7 @@ void myStartDefaultTask(void const * argument)
         }
         osDelay(1000);
         break;
-
-
-    	}
-
+        }
     }
 }
 
