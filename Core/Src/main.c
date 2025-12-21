@@ -31,6 +31,7 @@
 #include "stm32f429i_discovery.h"
 #include "stm32f429i_discovery_lcd.h"
 #include "stm32f429i_discovery_ts.h"
+#include "max30003.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -42,6 +43,9 @@
 /* USER CODE BEGIN PD */
 #define MAX_RETRIES 3
 #define LCD_FB_START_ADDRESS 0xD0000000
+
+#define MAX30003_CS_GPIO_Port GPIOB
+#define MAX30003_CS_Pin       GPIO_PIN_1
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -82,7 +86,7 @@ osThreadId renderTaskHandle;
 uint16_t lcdWidth  = 0;
 uint16_t lcdHeight = 0;
 
-
+volatile uint8_t ecgDataReady = 0;
 // Buffer for blood oxygen sensor
 #define BLOOD_OXY_BUFFER_SIZE 5
 typedef struct {
@@ -94,6 +98,8 @@ typedef struct {
 } BloodOxyBuffer;
 
 static BloodOxyBuffer bloodOxyBuffer = {0};
+
+MAX30003_Ctx max30003;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -188,7 +194,17 @@ void RenderSensorDataToLCD(void)
         snprintf(buf, sizeof(buf), "GSR not shown");
         BSP_LCD_DisplayStringAt(0, 50, (uint8_t*)buf, CENTER_MODE);
         break;
+    case 3:
+		BSP_LCD_DisplayStringAt(0, 20, (uint8_t *)"EKG (MAX30003)", CENTER_MODE);
 
+//		float hr = MAX30003_GetHR(&max30003);
+//		snprintf(buf, sizeof(buf), "HR: %.1f BPM", hr);
+//		BSP_LCD_DisplayStringAt(0, 50, (uint8_t*)buf, CENTER_MODE);
+//
+//		int32_t ecg = MAX30003_GetECG(&max30003);
+//		snprintf(buf, sizeof(buf), "Raw: %ld", ecg);
+//		BSP_LCD_DisplayStringAt(0, 70, (uint8_t*)buf, CENTER_MODE);
+		break;
     default:
         BSP_LCD_DisplayStringAt(0, 50, (uint8_t*)"Invalid sensor", CENTER_MODE);
         break;
@@ -212,10 +228,13 @@ void StartRenderTask(void const * argument)
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == GPIO_PIN_0) {
-        currentSensor = (currentSensor + 1) % 3;
+        currentSensor = (currentSensor + 1) % 4;
         printf("Przycisk wcisniety - aktualny sensor: %d\r\n", currentSensor);
         HAL_GPIO_TogglePin(GPIOG, LD3_Pin);
     }
+    if (GPIO_Pin == GPIO_PIN_1) { // <--- Zmień na Twój pin INT
+            ecgDataReady = 1; // Ustaw flagę "Dane gotowe!"
+        }
 }
 
 void myStartDefaultTask(void const * argument);
@@ -696,9 +715,9 @@ static void MX_LTDC_Init(void)
   hltdc.Init.VerticalSync = 0;
   hltdc.Init.AccumulatedHBP = 37;
   hltdc.Init.AccumulatedVBP = 3;
-  hltdc.Init.AccumulatedActiveW = 269;
+  hltdc.Init.AccumulatedActiveW = 277;
   hltdc.Init.AccumulatedActiveH = 323;
-  hltdc.Init.TotalWidth = 279;
+  hltdc.Init.TotalWidth = 287;
   hltdc.Init.TotalHeigh = 327;
   hltdc.Init.Backcolor.Blue = 0;
   hltdc.Init.Backcolor.Green = 0;
@@ -755,7 +774,7 @@ static void MX_SPI5_Init(void)
   hspi5.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi5.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi5.Init.NSS = SPI_NSS_SOFT;
-  hspi5.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  hspi5.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
   hspi5.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi5.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi5.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -1014,8 +1033,14 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : MEMS_INT1_Pin MEMS_INT2_Pin TP_INT1_Pin */
-  GPIO_InitStruct.Pin = MEMS_INT1_Pin|MEMS_INT2_Pin|TP_INT1_Pin;
+  /*Configure GPIO pin : MEMS_INT1_Pin */
+  GPIO_InitStruct.Pin = MEMS_INT1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(MEMS_INT1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : MEMS_INT2_Pin TP_INT1_Pin */
+  GPIO_InitStruct.Pin = MEMS_INT2_Pin|TP_INT1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
@@ -1063,8 +1088,22 @@ static void MX_GPIO_Init(void)
   HAL_NVIC_SetPriority(EXTI0_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(EXTI0_IRQn);
 
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
+  HAL_NVIC_SetPriority(EXTI1_IRQn, 5, 0); // Priorytet przerwania
+  HAL_NVIC_EnableIRQ(EXTI1_IRQn);
 
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+  GPIO_InitStruct.Pin = GPIO_PIN_1; // Upewnij się, że to właściwy Pin (nie ten sam co CS!)
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING; // MAX30003 generuje sygnał aktywny niski
+  GPIO_InitStruct.Pull = GPIO_PULLUP;          // Warto dodać Pull-Up dla stabilności
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+
+  GPIO_InitStruct.Pin = MAX30003_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(MAX30003_CS_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_WritePin(MAX30003_CS_GPIO_Port, MAX30003_CS_Pin, GPIO_PIN_SET);
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
@@ -1146,6 +1185,26 @@ void RequestRTCfromESP32(void)
     }
 }
 
+void MAX30003_ReadRegBurst(uint8_t reg, uint8_t *pData, uint8_t count)
+{
+    // Komenda odczytu: (Adres << 1) | 1
+    uint8_t txData = (reg << 1) | 0x01;
+
+    // 1. Chip Select LOW (Aktywacja) - ZMIEŃ PIN I PORT NA SWÓJ!
+    // Poniżej przykład dla CS na PD14, sprawdź jak masz u siebie
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_RESET);
+
+    // 2. Wyślij adres rejestru
+    // ZMIEŃ &hspi1 NA SWÓJ UCHWYT (np. &hspi2, &hspi4)
+    HAL_SPI_Transmit(&hspi5, &txData, 1, 10);
+
+    // 3. Odbierz 'count' bajtów danych
+    HAL_SPI_Receive(&hspi5, pData, count, 10);
+
+    // 4. Chip Select HIGH (Dezaktywacja)
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);
+}
+
 void myStartDefaultTask(void const * argument)
 {
     osDelay(1000);
@@ -1168,6 +1227,28 @@ void myStartDefaultTask(void const * argument)
     } else {
         printf("BloodOxy sensor not found\r\n");
     }
+    MAX30003_Init(&max30003, &hspi5, MAX30003_CS_GPIO_Port, MAX30003_CS_Pin);
+
+	if (!MAX30003_ReadDeviceID(&max30003)) {
+		printf("MAX30003 ID error (Check Wiring!)\r\n");
+	} else {
+		printf("MAX30003 ready\r\n");
+	}
+	static float hp_baseline = 0.0f;
+	static float lp_state = 0.0f;
+
+	const float fs = 128.0f;
+	const float dt = 1.0f / fs;
+
+	// High-pass ~0.5 Hz
+	const float fc_hp = 0.5f;
+	const float RC_hp = 1.0f / (2.0f * 3.14159f * fc_hp);
+	const float alpha_hp = dt / (RC_hp + dt);
+
+	// Low-pass ~25 Hz
+	const float fc_lp = 25.0f;
+	const float RC_lp = 1.0f / (2.0f * 3.14159f * fc_lp);
+	const float alpha_lp = dt / (RC_lp + dt);
 
     char uart5Msg[128];
     for (;;) {
@@ -1343,7 +1424,142 @@ void myStartDefaultTask(void const * argument)
         }
         osDelay(1000);
         break;
+//        case 3:
+//                {
+//                    // Czekamy na flagę z przerwania
+//                    if (ecgDataReady)
+//                    {
+//                         ecgDataReady = 0; // Kasujemy flagę
+//
+//                         // Pobierz próbkę (bez sprawdzania rejestru statusu po SPI, bo wiemy że jest)
+//                         int32_t raw = MAX30003_GetECG(&maxCtx);
+//
+//                         // --- FILTRACJA ---
+//                         float x = (float)raw;
+//                         hp_baseline = hp_baseline + alpha_hp * (x - hp_baseline);
+//                         float hp = x - hp_baseline;
+//                         lp_state = lp_state + alpha_lp * (hp - lp_state);
+//
+//                         float filtered_val = lp_state;
+//
+//                         // Wyślij do Serial Plottera
+//                         printf("%ld, %.2f\r\n", raw, filtered_val);
+//                    }
+//                    break;
+//                }
+        case 3:
+        {
+            // Czytamy status, żeby wiedzieć ile próbek siedzi w FIFO
+            uint32_t status = MAX30003_ReadReg(&max30003, 0x01);
+
+            // Jeśli bit 23 (EINT) jest ustawiony - mamy dane
+            if (status & 0x800000) {
+                int32_t ecg_val;
+                // Czytamy aż opróżnimy FIFO (zapobiega lagom)
+                while(MAX30003_GetECG_Sample(&max30003, &ecg_val)) {
+                    // Wysyłamy surowe dane - do Serial Plottera w Arduino IDE lub innego tool'a
+                    // Używaj tylko printf("%ld\n", ecg_val) do testów, żeby nie marnować czasu procesora
+//                	ecg_val = ecg_val/1000;
+                    printf("%ld\r\n", ecg_val);
+                }
+            }
+            // MAŁY delay, żeby nie zatykać SPI, ale wystarczający by obsłużyć 128Hz
+            osDelay(5);
+            break;
         }
+
+
+
+//        case 3:
+//                {
+//                    // Czytamy status (czy jest nowa próbka?)
+//                    uint32_t status = MAX30003_ReadReg(&maxCtx, 0x01); // REG_STATUS
+//
+//                    // Sprawdzamy bit 23 (EINT) - flaga gotowości danych EKG
+//                    if (status & (1 << 23))
+//                    {
+//                        // Pobieramy próbkę
+//                        int32_t raw = MAX30003_GetECG(&maxCtx);
+//
+//                        // Dla testu kalibracji interesuje nas surowa wartość
+//                        // Powinna skakać np. między -500 a +500 (wartości przykładowe)
+//                        // w równych odstępach czasu (prostokąt)
+//                        printf("%ld\r\n", raw);
+//                    }
+//                    // Nie dodawaj tu dużego delaya!
+//                    break;
+//                }
+
+//        case 3:
+//                {
+//                    // 1. ODCZYTAJ STATUS UKŁADU
+//                    // Sprawdzamy, czy MAX30003 ma gotowe nowe dane.
+//                    // Rejestr 0x01 (STATUS). Bit 23 to EINT (ECG FIFO Interrupt).
+//                    uint32_t status = MAX30003_ReadReg(&maxCtx, 0x01);
+//
+//                    // Sprawdzamy maskę 0x800000 (czyli bit nr 23)
+//                    if (status & 0x800000)
+//                    {
+//                        // JEST NOWA DANA - wchodzimy tutaj tylko ~128 razy na sekundę
+//
+//                        int32_t raw_ecg = MAX30003_GetECG(&maxCtx);
+//                        float mv_ecg = MAX30003_ScaleToMV(raw_ecg);
+//                        float hr = MAX30003_GetHR(&maxCtx);
+//
+//                        // Wypisujemy tylko świeże dane
+//                        // Format dla Serial Plottera: Raw, Voltage
+//                        printf("%ld, %.3f\r\n", raw_ecg, mv_ecg);
+//                    }
+//
+//                    // Jeśli nie ma nowych danych, pętla leci dalej "na pusto"
+//                    // i nie wypisuje duplikatów ani śmieci.
+//
+//                    // Krótkie opóźnienie, żeby nie zamęczyć magistrali SPI odczytywaniem statusu
+//                    osDelay(1);
+//                    break;
+//                }
+//        case 3:
+//		{
+//			// Pobieramy dane
+//			float hr = MAX30003_GetHR(&maxCtx);
+//			int32_t raw_ecg = MAX30003_GetECG(&maxCtx);
+//			float mv_ecg = MAX30003_ScaleToMV(raw_ecg); // Konwersja na mV
+//
+//			uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
+//			char payload[96]; // Zwiększony rozmiar bufora
+//
+//			// Tworzymy JSON: timestamp, HR, surowe EKG i napięcie w mV
+//			snprintf(payload, sizeof(payload),
+//					 "{\"timestamp\":%lu,\"hr\":%.1f,\"ecg_raw\":%ld,\"ecg_mv\":%.3f}",
+//					 timestamp, hr, raw_ecg, mv_ecg);
+//
+//			uint8_t crc = calcChecksum(payload, strlen(payload));
+//			printf("MAX30003 -> HR: %.1f, ECG: %.3f mV, CRC: %d\r\n", hr, mv_ecg, crc);
+//
+//			// Dodajemy CRC do wiadomości UART
+//			snprintf(uart5Msg, sizeof(uart5Msg), "%s,\"crc\":%d}\r\n", payload, crc);
+//
+//			// Wysyłanie (logika Retry taka sama jak w innych case'ach)
+//			HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+//			for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+//				if (attempt == 0) osDelay(10);
+//				HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+//
+//				if (waitForAck(&huart5, 500)) {
+//					printf("ACK received\r\n\n");
+//					break;
+//				} else {
+//					printf("NACK or no response — retrying...\r\n");
+//				}
+//			}
+//
+//			// EKG jest sygnałem szybkim.
+//			// Delay 100ms da 10 próbek na sekundę (za mało na wykres, OK dla HR).
+//			// Jeśli chcesz wykres, musisz usunąć ten delay lub zbierać dane w buforze.
+//			osDelay(250);
+//			break;
+//		}
+    }
     }
 }
 
