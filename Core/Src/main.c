@@ -66,6 +66,7 @@ I2C_HandleTypeDef hi2c3;
 
 LTDC_HandleTypeDef hltdc;
 
+SPI_HandleTypeDef hspi4;
 SPI_HandleTypeDef hspi5;
 
 TIM_HandleTypeDef htim1;
@@ -117,6 +118,7 @@ static void MX_TIM7_Init(void);
 static void MX_DAC_Init(void);
 static void MX_UART5_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_SPI4_Init(void);
 void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
@@ -285,6 +287,7 @@ int main(void)
   MX_DAC_Init();
   MX_UART5_Init();
   MX_ADC1_Init();
+  MX_SPI4_Init();
   /* USER CODE BEGIN 2 */
   #define LCD_FRAMEBUFFER       ((uint32_t)0xD0000000)
   #define LCD_WIDTH             240
@@ -752,6 +755,44 @@ static void MX_LTDC_Init(void)
 }
 
 /**
+  * @brief SPI4 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI4_Init(void)
+{
+
+  /* USER CODE BEGIN SPI4_Init 0 */
+
+  /* USER CODE END SPI4_Init 0 */
+
+  /* USER CODE BEGIN SPI4_Init 1 */
+
+  /* USER CODE END SPI4_Init 1 */
+  /* SPI4 parameter configuration*/
+  hspi4.Instance = SPI4;
+  hspi4.Init.Mode = SPI_MODE_MASTER;
+  hspi4.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi4.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi4.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi4.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi4.Init.NSS = SPI_NSS_SOFT;
+  hspi4.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
+  hspi4.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi4.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi4.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi4.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI4_Init 2 */
+
+  /* USER CODE END SPI4_Init 2 */
+
+}
+
+/**
   * @brief SPI5 Initialization Function
   * @param None
   * @retval None
@@ -774,7 +815,7 @@ static void MX_SPI5_Init(void)
   hspi5.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi5.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi5.Init.NSS = SPI_NSS_SOFT;
-  hspi5.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
+  hspi5.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
   hspi5.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi5.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi5.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -999,13 +1040,13 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
-  __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
@@ -1087,9 +1128,6 @@ static void MX_GPIO_Init(void)
   /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI0_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(EXTI0_IRQn);
-
-  HAL_NVIC_SetPriority(EXTI1_IRQn, 5, 0); // Priorytet przerwania
-  HAL_NVIC_EnableIRQ(EXTI1_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
   GPIO_InitStruct.Pin = GPIO_PIN_1; // Upewnij się, że to właściwy Pin (nie ten sam co CS!)
@@ -1196,10 +1234,10 @@ void MAX30003_ReadRegBurst(uint8_t reg, uint8_t *pData, uint8_t count)
 
     // 2. Wyślij adres rejestru
     // ZMIEŃ &hspi1 NA SWÓJ UCHWYT (np. &hspi2, &hspi4)
-    HAL_SPI_Transmit(&hspi5, &txData, 1, 10);
+    HAL_SPI_Transmit(&hspi4, &txData, 1, 10);
 
     // 3. Odbierz 'count' bajtów danych
-    HAL_SPI_Receive(&hspi5, pData, count, 10);
+    HAL_SPI_Receive(&hspi4, pData, count, 10);
 
     // 4. Chip Select HIGH (Dezaktywacja)
     HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);
@@ -1227,7 +1265,10 @@ void myStartDefaultTask(void const * argument)
     } else {
         printf("BloodOxy sensor not found\r\n");
     }
-    MAX30003_Init(&max30003, &hspi5, MAX30003_CS_GPIO_Port, MAX30003_CS_Pin);
+    MAX30003_Init(&max30003, &hspi4, MAX30003_CS_GPIO_Port, MAX30003_CS_Pin);
+
+    HAL_Delay(100); // <--- DODAJ TO, żeby ID Error zniknął
+
 
 	if (!MAX30003_ReadDeviceID(&max30003)) {
 		printf("MAX30003 ID error (Check Wiring!)\r\n");
@@ -1447,121 +1488,34 @@ void myStartDefaultTask(void const * argument)
 //                    }
 //                    break;
 //                }
-        case 3:
-        {
-            // Czytamy status, żeby wiedzieć ile próbek siedzi w FIFO
-            uint32_t status = MAX30003_ReadReg(&max30003, 0x01);
+        case 3: // EKG MAX30003
+                {
+                    // 1. Sprawdzamy status
+                    uint32_t status = MAX30003_ReadReg(&max30003, 0x01);
 
-            // Jeśli bit 23 (EINT) jest ustawiony - mamy dane
-            if (status & 0x800000) {
-                int32_t ecg_val;
-                // Czytamy aż opróżnimy FIFO (zapobiega lagom)
-                while(MAX30003_GetECG_Sample(&max30003, &ecg_val)) {
-                    // Wysyłamy surowe dane - do Serial Plottera w Arduino IDE lub innego tool'a
-                    // Używaj tylko printf("%ld\n", ecg_val) do testów, żeby nie marnować czasu procesora
-//                	ecg_val = ecg_val/1000;
-                    printf("%ld\r\n", ecg_val);
+                    // Jeśli przepełnienie (C00000) - Resetujemy
+                    // if (status & 0x400000) {
+                    //     MAX30003_WriteReg(&max30003, 0x00, 0x000000); // FIFO Reset
+                    //     MAX30003_WriteReg(&max30003, 0x09, 0x000000); // SYNCH
+                    // }
+
+                    // Jeśli są dane (800000) - Czytamy
+                    if (status & 0x800000) {
+                        int32_t ecg_val;
+                        // Czytamy wszystko z kolejki
+                        while(MAX30003_GetECG_Sample(&max30003, &ecg_val)) {
+                            printf("%ld\r\n", ecg_val);
+                        }
+                    }
+
+                    // Krótkie opóźnienie dla EKG
+                    osDelay(5);
+                    break;
                 }
-            }
-            // MAŁY delay, żeby nie zatykać SPI, ale wystarczający by obsłużyć 128Hz
-            osDelay(5);
-            break;
-        }
 
-
-
-//        case 3:
-//                {
-//                    // Czytamy status (czy jest nowa próbka?)
-//                    uint32_t status = MAX30003_ReadReg(&maxCtx, 0x01); // REG_STATUS
-//
-//                    // Sprawdzamy bit 23 (EINT) - flaga gotowości danych EKG
-//                    if (status & (1 << 23))
-//                    {
-//                        // Pobieramy próbkę
-//                        int32_t raw = MAX30003_GetECG(&maxCtx);
-//
-//                        // Dla testu kalibracji interesuje nas surowa wartość
-//                        // Powinna skakać np. między -500 a +500 (wartości przykładowe)
-//                        // w równych odstępach czasu (prostokąt)
-//                        printf("%ld\r\n", raw);
-//                    }
-//                    // Nie dodawaj tu dużego delaya!
-//                    break;
-//                }
-
-//        case 3:
-//                {
-//                    // 1. ODCZYTAJ STATUS UKŁADU
-//                    // Sprawdzamy, czy MAX30003 ma gotowe nowe dane.
-//                    // Rejestr 0x01 (STATUS). Bit 23 to EINT (ECG FIFO Interrupt).
-//                    uint32_t status = MAX30003_ReadReg(&maxCtx, 0x01);
-//
-//                    // Sprawdzamy maskę 0x800000 (czyli bit nr 23)
-//                    if (status & 0x800000)
-//                    {
-//                        // JEST NOWA DANA - wchodzimy tutaj tylko ~128 razy na sekundę
-//
-//                        int32_t raw_ecg = MAX30003_GetECG(&maxCtx);
-//                        float mv_ecg = MAX30003_ScaleToMV(raw_ecg);
-//                        float hr = MAX30003_GetHR(&maxCtx);
-//
-//                        // Wypisujemy tylko świeże dane
-//                        // Format dla Serial Plottera: Raw, Voltage
-//                        printf("%ld, %.3f\r\n", raw_ecg, mv_ecg);
-//                    }
-//
-//                    // Jeśli nie ma nowych danych, pętla leci dalej "na pusto"
-//                    // i nie wypisuje duplikatów ani śmieci.
-//
-//                    // Krótkie opóźnienie, żeby nie zamęczyć magistrali SPI odczytywaniem statusu
-//                    osDelay(1);
-//                    break;
-//                }
-//        case 3:
-//		{
-//			// Pobieramy dane
-//			float hr = MAX30003_GetHR(&maxCtx);
-//			int32_t raw_ecg = MAX30003_GetECG(&maxCtx);
-//			float mv_ecg = MAX30003_ScaleToMV(raw_ecg); // Konwersja na mV
-//
-//			uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
-//			char payload[96]; // Zwiększony rozmiar bufora
-//
-//			// Tworzymy JSON: timestamp, HR, surowe EKG i napięcie w mV
-//			snprintf(payload, sizeof(payload),
-//					 "{\"timestamp\":%lu,\"hr\":%.1f,\"ecg_raw\":%ld,\"ecg_mv\":%.3f}",
-//					 timestamp, hr, raw_ecg, mv_ecg);
-//
-//			uint8_t crc = calcChecksum(payload, strlen(payload));
-//			printf("MAX30003 -> HR: %.1f, ECG: %.3f mV, CRC: %d\r\n", hr, mv_ecg, crc);
-//
-//			// Dodajemy CRC do wiadomości UART
-//			snprintf(uart5Msg, sizeof(uart5Msg), "%s,\"crc\":%d}\r\n", payload, crc);
-//
-//			// Wysyłanie (logika Retry taka sama jak w innych case'ach)
-//			HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
-//			for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-//				if (attempt == 0) osDelay(10);
-//				HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
-//
-//				if (waitForAck(&huart5, 500)) {
-//					printf("ACK received\r\n\n");
-//					break;
-//				} else {
-//					printf("NACK or no response — retrying...\r\n");
-//				}
-//			}
-//
-//			// EKG jest sygnałem szybkim.
-//			// Delay 100ms da 10 próbek na sekundę (za mało na wykres, OK dla HR).
-//			// Jeśli chcesz wykres, musisz usunąć ten delay lub zbierać dane w buforze.
-//			osDelay(250);
-//			break;
-//		}
-    }
-    }
-}
+                } // End switch
+            } // End for
+        } // En
 
 uint8_t calcChecksum(const char* str, size_t len) {
     uint8_t sum = 0;
