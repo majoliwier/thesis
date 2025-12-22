@@ -1222,6 +1222,14 @@ void RequestRTCfromESP32(void)
         printf("Timeout: no response from ESP32.\r\n");
     }
 }
+// Zmienne do rysowania wykresu
+    static uint16_t graphX = 0;      // Pozycja pozioma
+    static uint16_t lastGraphY = 160; // Poprzednia pozycja pionowa (startujemy na środku)
+
+    // Parametry ekranu (sprawdź czy pasują do Twojej orientacji)
+    #define GRAPH_H_CENTER 160       // Połowa wysokości (320 / 2)
+    #define GRAPH_MAX_X    240       // Szerokość ekranu
+    #define GRAPH_SCALE    30
 
 void MAX30003_ReadRegBurst(uint8_t reg, uint8_t *pData, uint8_t count)
 {
@@ -1490,26 +1498,55 @@ void myStartDefaultTask(void const * argument)
 //                }
         case 3: // EKG MAX30003
                 {
-                    // 1. Sprawdzamy status
                     uint32_t status = MAX30003_ReadReg(&max30003, 0x01);
 
-                    // Jeśli przepełnienie (C00000) - Resetujemy
-                    // if (status & 0x400000) {
-                    //     MAX30003_WriteReg(&max30003, 0x00, 0x000000); // FIFO Reset
-                    //     MAX30003_WriteReg(&max30003, 0x09, 0x000000); // SYNCH
-                    // }
+                    // Obsługa przepełnienia (Standard)
+                    if (status & 0x400000) {
+                        MAX30003_WriteReg(&max30003, 0x00, 0x000000);
+                        MAX30003_WriteReg(&max30003, 0x09, 0x000000);
+                    }
 
-                    // Jeśli są dane (800000) - Czytamy
                     if (status & 0x800000) {
                         int32_t ecg_val;
-                        // Czytamy wszystko z kolejki
+
+                        // Pętla pobiera wszystkie dostępne próbki
                         while(MAX30003_GetECG_Sample(&max30003, &ecg_val)) {
-                            printf("%ld\r\n", ecg_val);
+
+                            // 1. SKALOWANIE: Dopasuj surowe dane do ekranu
+                            // Odejmujemy ecg_val, bo na LCD Y rośnie w dół, a chcemy górę na górze
+                            // Dzielimy przez GRAPH_SCALE, żeby zmniejszyć amplitudę
+                            int16_t newY = GRAPH_H_CENTER - (ecg_val / GRAPH_SCALE);
+
+                            // 2. Ograniczenie (Clamping) - żeby nie rysować poza ekranem
+                            if (newY < 0) newY = 0;
+                            if (newY > 319) newY = 319; // Zakładając wysokość 320
+
+                            // 3. RYSOWANIE "KASOWNIKA" (Eraser Bar)
+                            // Czyścimy wąski pasek przed wykresem, żeby usunąć stare dane
+                            BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+                            BSP_LCD_DrawLine(graphX + 1, 0, graphX + 1, 320); // Czyścimy linię przed nami
+
+                            // 4. RYSOWANIE LINII SYGNAŁU
+                            // Łączymy poprzedni punkt z nowym
+                            BSP_LCD_SetTextColor(LCD_COLOR_GREEN); // Kolor EKG
+                            BSP_LCD_DrawLine(graphX, lastGraphY, graphX + 1, newY);
+
+                            // 5. AKTUALIZACJA POZYCJI
+                            lastGraphY = newY; // Zapamiętaj Y dla następnej linii
+                            graphX++;          // Przesuń się w prawo
+
+                            // 6. ZAWIJANIE (Oscyloskop)
+                            if (graphX >= (GRAPH_MAX_X - 2)) {
+                                graphX = 0; // Wróć na początek
+                                // Opcjonalnie: lastGraphY = newY; // Żeby nie było krechy przez cały ekran przy powrocie
+                            }
+
+                            // (Opcjonalnie) Nadal wypisuj na UART, żebyś miał podgląd w komputerze
+                            // printf("%ld\r\n", ecg_val);
                         }
                     }
 
-                    // Krótkie opóźnienie dla EKG
-                    osDelay(5);
+                    osDelay(5); // Krótkie opóźnienie
                     break;
                 }
 
