@@ -24,21 +24,18 @@
 #define MAX30003_REG_RTOR         0x25
 #define MAX30003_REG_NO_OP_ALT    0x7F
 
-// Definicja struktury kontekstu
 typedef struct {
     SPI_HandleTypeDef *hspi;
     GPIO_TypeDef *cs_port;
     uint16_t cs_pin;
 } MAX30003_Ctx;
 
-// --- Deklaracje funkcji ---
 void MAX30003_Init(MAX30003_Ctx *c, SPI_HandleTypeDef *h, GPIO_TypeDef *p, uint16_t pin);
 void MAX30003_WriteReg(MAX30003_Ctx *c, uint8_t r, uint32_t d);
 uint32_t MAX30003_ReadReg(MAX30003_Ctx *c, uint8_t r);
 
-// Funkcje pomiarowe
 int32_t MAX30003_GetECG(MAX30003_Ctx *c);
-float MAX30003_GetHR(MAX30003_Ctx *c);       // <-- Nowa funkcja
-uint32_t MAX30003_ReadDeviceID(MAX30003_Ctx *c); // <-- Nowa funkcja
+float MAX30003_GetHR(MAX30003_Ctx *c);
+uint32_t MAX30003_ReadDeviceID(MAX30003_Ctx *c);
 
-#endif /* MAX30003_H_ */
+#endif

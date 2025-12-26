@@ -42,10 +42,18 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define MAX_RETRIES 3
-#define LCD_FB_START_ADDRESS 0xD0000000
 
-#define MAX30003_CS_GPIO_Port GPIOB
-#define MAX30003_CS_Pin       GPIO_PIN_1
+// --- TE DEFINICJE MUSZĄ BYĆ TUTAJ, GLOBALNIE! ---
+//#define LCD_FRAMEBUFFER       ((uint32_t)0xD0000000)
+//#define LCD_WIDTH             240
+//#define LCD_HEIGHT            320
+//
+//#define COLOR_BLACK           0x0000
+//#define COLOR_WHITE           0xFFFF
+//#define COLOR_GREEN           0x07E0
+
+#define MAX30003_CS_GPIO_Port GPIOC
+#define MAX30003_CS_Pin       GPIO_PIN_4
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -84,11 +92,9 @@ osThreadId myTaskHandle;
 osThreadId touchTaskHandle;
 osThreadId renderTaskHandle;
 
-uint16_t lcdWidth  = 0;
-uint16_t lcdHeight = 0;
+volatile uint8_t systemState = 1;
+volatile uint8_t systemStartupComplete = 0;
 
-volatile uint8_t ecgDataReady = 0;
-// Buffer for blood oxygen sensor
 #define BLOOD_OXY_BUFFER_SIZE 5
 typedef struct {
     int16_t spo2_values[BLOOD_OXY_BUFFER_SIZE];
@@ -98,9 +104,26 @@ typedef struct {
     int32_t last_valid_hr;
 } BloodOxyBuffer;
 
+typedef struct {
+    uint32_t value;
+    char mood[16];
+} GSR_Data_t;
+
+volatile GSR_Data_t gsrData;
+
 static BloodOxyBuffer bloodOxyBuffer = {0};
+volatile uint8_t measurementActive = 0;
+volatile uint8_t updateScreenFlag = 0;
+osMessageQId ecgQueueHandle;
+osMessageQId tempQueueHandle;
+osMessageQId oxyQueueHandle;
+osMessageQId gsrQueueHandle;
 
 MAX30003_Ctx max30003;
+
+#define BUTTON_AREA_Y_START 270
+#define BUTTON_HEIGHT       50
+#define BUTTON_WIDTH        80
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -119,14 +142,14 @@ static void MX_DAC_Init(void);
 static void MX_UART5_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_SPI4_Init(void);
-void StartDefaultTask(void const * argument);
+void StartDefaultTask(const void *argument);
 
 /* USER CODE BEGIN PFP */
 uint8_t calcChecksum(const char* str, size_t len);
 bool waitForAck(UART_HandleTypeDef* uart, uint32_t timeout_ms);
 
-void StartTouchTask(void const * argument);
-void StartRenderTask(void const * argument);
+void StartTouchTask(const void *argument);
+void StartRenderTask(const void *argument);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -147,99 +170,277 @@ int fputc(int ch, FILE *f)
 }
 #endif
 
-
-
 volatile uint8_t currentSensor = 0;
 
 extern uint32_t rtc_base_time;
-
 
 MLX90614_Data mlxData;
 BoodOxyData oxyData;
 extern uint16_t lcdHeight;
 
 
-
-void RenderSensorDataToLCD(void)
+void StartRenderTask(const void *argument)
 {
+	while (systemStartupComplete == 0) {
+	        osDelay(50);
+	    }
+    // Start systemu
+    BSP_LCD_DisplayOn();
     BSP_LCD_Clear(LCD_COLOR_BLACK);
-    BSP_LCD_SetBackColor(LCD_COLOR_BLACK);
-    BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+    DrawHeader();
+    DrawBottomButtons();
 
-    char buf[64];
+    const uint16_t GRAPH_TOP = 35;
+    const uint16_t GRAPH_BOT = 270;
+    static uint16_t x = 0;
+    static uint16_t lastY = 160;
+    static uint8_t lastSensor = 255;
+    static uint8_t lastSystemState = 1;
 
-    switch (currentSensor)
+    for (;;)
     {
-    case 0:
-        BSP_LCD_DisplayStringAt(0, 20, (uint8_t *)"TEMPERATURA", CENTER_MODE);
+        // ==========================================================
+        // 1. ZARZĄDZANIE ENERGIĄ (SUSPEND / RESUME)
+        // ==========================================================
 
-        snprintf(buf, sizeof(buf), "Ambient: %.2f C", mlxData.ambient);
-        BSP_LCD_DisplayStringAt(0, 50, (uint8_t*)buf, CENTER_MODE);
+        // --- PRZEJŚCIE W STAN OFF ---
+        if (systemState == 0)
+        {
+            if (lastSystemState == 1)
+            {
+                // 1. Zamaluj ekran na czarno (blokada światła)
+                BSP_LCD_Clear(LCD_COLOR_BLACK);
 
-        snprintf(buf, sizeof(buf), "Object : %.2f C", mlxData.object);
-        BSP_LCD_DisplayStringAt(0, 70, (uint8_t*)buf, CENTER_MODE);
-        break;
+                // 2. ZATRZYMAJ INNE TASKI (Usypiamy sensory i dotyk)
+                // Dzięki temu myTask nie mieli w kółko I2C, a touchTask nie mieli SPI.
+                osThreadSuspend(myTaskHandle);
+                osThreadSuspend(touchTaskHandle);
 
-    case 1:
-        BSP_LCD_DisplayStringAt(0, 20, (uint8_t *)"PULSOKSYMETR", CENTER_MODE);
+                lastSystemState = 0;
+            }
 
-        snprintf(buf, sizeof(buf), "SpO2 : %d %%", oxyData.spo2);
-        BSP_LCD_DisplayStringAt(0, 50, (uint8_t*)buf, CENTER_MODE);
+            // RenderTask też idzie spać (czeka na zmianę flagi), odświeżanie co 200ms
+            osDelay(200);
+            continue;
+        }
 
-        snprintf(buf, sizeof(buf), "HR   : %ld bpm", oxyData.heartbeat);
-        BSP_LCD_DisplayStringAt(0, 70, (uint8_t*)buf, CENTER_MODE);
-        break;
+        // --- PRZEJŚCIE W STAN ON ---
+        else if (systemState == 1 && lastSystemState == 0)
+        {
+            // 1. WZNÓW INNE TASKI (Budzimy je)
+            osThreadResume(myTaskHandle);
+            osThreadResume(touchTaskHandle);
 
-    case 2:
-        BSP_LCD_DisplayStringAt(0, 20, (uint8_t *)"GSR", CENTER_MODE);
+            // 2. Przywróć ekran
+            BSP_LCD_DisplayOn();
+            osDelay(100);
+            BSP_LCD_Clear(LCD_COLOR_BLACK);
+            DrawHeader();
+            DrawBottomButtons();
 
-        snprintf(buf, sizeof(buf), "GSR not shown");
-        BSP_LCD_DisplayStringAt(0, 50, (uint8_t*)buf, CENTER_MODE);
-        break;
-    case 3:
-		BSP_LCD_DisplayStringAt(0, 20, (uint8_t *)"EKG (MAX30003)", CENTER_MODE);
+            BSP_LCD_SetBackColor(LCD_COLOR_BLACK);
+            BSP_LCD_SetTextColor(0xFFFFFFFF); // Biały
+            BSP_LCD_SetFont(&Font24);
+            BSP_LCD_DisplayStringAt(0, 120, (uint8_t*)"SYSTEM WAKEUP", CENTER_MODE);
 
-//		float hr = MAX30003_GetHR(&max30003);
-//		snprintf(buf, sizeof(buf), "HR: %.1f BPM", hr);
-//		BSP_LCD_DisplayStringAt(0, 50, (uint8_t*)buf, CENTER_MODE);
-//
-//		int32_t ecg = MAX30003_GetECG(&max30003);
-//		snprintf(buf, sizeof(buf), "Raw: %ld", ecg);
-//		BSP_LCD_DisplayStringAt(0, 70, (uint8_t*)buf, CENTER_MODE);
-		break;
-    default:
-        BSP_LCD_DisplayStringAt(0, 50, (uint8_t*)"Invalid sensor", CENTER_MODE);
-        break;
+            // 3. Reset zmiennych, żeby wykresy nie wariowały
+            x = 0;
+            osDelay(500);
+            updateScreenFlag = 1; // Wymuś narysowanie właściwego ekranu
+            lastSystemState = 1;
+        }
+
+        // ==========================================================
+        // 2. NORMALNA PRACA (Reszta kodu bez zmian)
+        // ==========================================================
+
+        // Zmiana Sensora
+        if (currentSensor != lastSensor)
+        {
+            BSP_LCD_Clear(LCD_COLOR_BLACK);
+            DrawHeader();
+            DrawBottomButtons();
+
+            if (measurementActive) {
+                BSP_LCD_SetBackColor(LCD_COLOR_BLACK);
+                BSP_LCD_SetTextColor(LCD_COLOR_YELLOW);
+                BSP_LCD_SetFont(&Font16);
+
+                if(currentSensor == 1) BSP_LCD_DisplayStringAt(0, 100, (uint8_t*)"Place Finger...", CENTER_MODE);
+                else if(currentSensor == 3) BSP_LCD_DisplayStringAt(0, 100, (uint8_t*)"Initializing ECG...", CENTER_MODE);
+                else BSP_LCD_DisplayStringAt(0, 100, (uint8_t*)"Measuring...", CENTER_MODE);
+            }
+            lastSensor = currentSensor;
+            updateScreenFlag = 0;
+            x = 0;
+        }
+        // Start / Stop (Pauza na ekranie)
+        else if (updateScreenFlag)
+        {
+            if (!measurementActive) // PAUZA
+            {
+                DrawBottomButtons();
+                BSP_LCD_SetTextColor(LCD_COLOR_BLACK); BSP_LCD_FillRect(50, 110, 140, 60);
+                BSP_LCD_SetTextColor(LCD_COLOR_WHITE); // Ramka (Czerwona)
+
+                BSP_LCD_DrawRect(50, 110, 140, 60);
+                BSP_LCD_DrawRect(51, 111, 138, 58);
+
+                BSP_LCD_SetBackColor(LCD_COLOR_BLACK);
+                BSP_LCD_SetTextColor(LCD_COLOR_RED);
+                BSP_LCD_SetFont(&Font24);
+                BSP_LCD_DisplayStringAt(0, 128, (uint8_t*)"PAUSED", CENTER_MODE);
+            }
+            else
+            {
+                BSP_LCD_Clear(LCD_COLOR_BLACK); DrawHeader(); DrawBottomButtons();
+                BSP_LCD_SetBackColor(LCD_COLOR_BLACK); BSP_LCD_SetTextColor(LCD_COLOR_YELLOW); BSP_LCD_SetFont(&Font16);
+                if(currentSensor == 1) BSP_LCD_DisplayStringAt(0, 100, (uint8_t*)"Place Finger...", CENTER_MODE);
+                else BSP_LCD_DisplayStringAt(0, 100, (uint8_t*)"Measuring...", CENTER_MODE);
+                x = 0;
+            }
+            updateScreenFlag = 0;
+        }
+
+        if (!measurementActive) {
+            if(currentSensor == 3) { osEvent evt = osMessageGet(ecgQueueHandle, 10); }
+            else { osDelay(50); }
+            continue;
+        }
+
+        if (currentSensor == 0) {
+             osEvent evt = osMessageGet(tempQueueHandle, 10);
+             if (evt.status == osEventMessage) {
+                 MLX90614_Data *pData = (MLX90614_Data*)evt.value.v;
+                 BSP_LCD_SetTextColor(LCD_COLOR_BLACK); BSP_LCD_FillRect(0, 80, 240, 60);
+                 BSP_LCD_SetBackColor(LCD_COLOR_BLACK); BSP_LCD_SetTextColor(0xFFFFFFFF); BSP_LCD_SetFont(&Font16);
+                 char buf[32];
+                 snprintf(buf, sizeof(buf), "Ambient: %.2f C", pData->ambient);
+                 BSP_LCD_DisplayStringAt(0, 80, (uint8_t*)buf, CENTER_MODE);
+                 snprintf(buf, sizeof(buf), "Object : %.2f C", pData->object);
+                 BSP_LCD_DisplayStringAt(0, 110, (uint8_t*)buf, CENTER_MODE);
+             }
+        }
+        else if (currentSensor == 1) {
+             osEvent evt = osMessageGet(oxyQueueHandle, 10);
+             if (evt.status == osEventMessage) {
+                 BoodOxyData *pData = (BoodOxyData*)evt.value.v;
+                 BSP_LCD_SetTextColor(LCD_COLOR_BLACK); BSP_LCD_FillRect(0, 80, 240, 120);
+                 BSP_LCD_SetBackColor(LCD_COLOR_BLACK); BSP_LCD_SetTextColor(0xFFFFFFFF); BSP_LCD_SetFont(&Font16);
+                 char buf[32];
+                 snprintf(buf, sizeof(buf), "SpO2 : %d %%", pData->spo2);
+                 BSP_LCD_DisplayStringAt(0, 80, (uint8_t*)buf, CENTER_MODE);
+                 snprintf(buf, sizeof(buf), "HR   : %ld bpm", pData->heartbeat);
+                 BSP_LCD_DisplayStringAt(0, 110, (uint8_t*)buf, CENTER_MODE);
+                 BSP_LCD_SetTextColor(LCD_COLOR_GREEN); // Tu już daję Green, zakładam że działa ok
+                 BSP_LCD_DisplayStringAt(0, 140, (uint8_t*)"RESULT READY", CENTER_MODE);
+             }
+        }
+        else if (currentSensor == 2) {
+             osEvent evt = osMessageGet(gsrQueueHandle, 10);
+             if (evt.status == osEventMessage) {
+                 GSR_Data_t *pData = (GSR_Data_t*)evt.value.v;
+                 BSP_LCD_SetTextColor(LCD_COLOR_BLACK); BSP_LCD_FillRect(0, 80, 240, 60);
+                 BSP_LCD_SetBackColor(LCD_COLOR_BLACK); BSP_LCD_SetTextColor(0xFFFFFFFF); BSP_LCD_SetFont(&Font16);
+                 char buf[32];
+                 snprintf(buf, sizeof(buf), "GSR Avg: %lu", pData->value);
+                 BSP_LCD_DisplayStringAt(0, 80, (uint8_t*)buf, CENTER_MODE);
+
+                 if (strcmp((char*)pData->mood, "Stressed") == 0) BSP_LCD_SetTextColor(LCD_COLOR_RED); // Czerwony
+                 else if (strcmp((char*)pData->mood, "Relaxed") == 0) BSP_LCD_SetTextColor(LCD_COLOR_GREEN); // Zielony
+                 else BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+
+                 snprintf(buf, sizeof(buf), "Mood: %s", pData->mood);
+                 BSP_LCD_DisplayStringAt(0, 110, (uint8_t*)buf, CENTER_MODE);
+             }
+        }
+        else if (currentSensor == 3) {
+             osEvent evt = osMessageGet(ecgQueueHandle, 2);
+             if (evt.status == osEventMessage) {
+                if(x==0) { BSP_LCD_SetTextColor(LCD_COLOR_BLACK); BSP_LCD_FillRect(0, 80, 240, 40); }
+                int32_t val = evt.value.v;
+                int16_t newY = 160 - (val / 35);
+                if (newY < GRAPH_TOP) newY = GRAPH_TOP; if (newY > GRAPH_BOT) newY = GRAPH_BOT;
+                BSP_LCD_SetTextColor(LCD_COLOR_BLACK); BSP_LCD_FillRect(x+1, GRAPH_TOP, 10, GRAPH_BOT-GRAPH_TOP);
+                BSP_LCD_SetTextColor(LCD_COLOR_GREEN); // Zielony wykres
+                if(x>0) BSP_LCD_DrawLine(x-1, lastY, x, newY);
+                lastY = newY; x++;
+                if (x >= 240) x = 0;
+             }
+        }
     }
 }
-void StartRenderTask(void const * argument)
-{
-    printf("Render task START\r\n");
-    osDelay(3000);
-
-    while (1)
-    {
-
-        RenderSensorDataToLCD();
-
-        osDelay(500);
-    }
-}
-
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-    if (GPIO_Pin == GPIO_PIN_0) {
-        currentSensor = (currentSensor + 1) % 4;
-        printf("Przycisk wcisniety - aktualny sensor: %d\r\n", currentSensor);
-        HAL_GPIO_TogglePin(GPIOG, LD3_Pin);
-    }
-    if (GPIO_Pin == GPIO_PIN_1) { // <--- Zmień na Twój pin INT
-            ecgDataReady = 1; // Ustaw flagę "Dane gotowe!"
+    // =========================================================
+    // 1. OBSŁUGA KABLA WIFI (PC1) - TO JEST NOWE
+    // =========================================================
+    if (GPIO_Pin == GPIO_PIN_1)
+    {
+        // Sprawdzamy czy stan jest NISKI (0V = Brak WiFi)
+        if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_1) == GPIO_PIN_RESET)
+        {
+            printf("!!! HARDWARE SIGNAL: WIFI LOST !!!\r\n");
+
+            // 1. Zatrzymaj pomiary i wyczyść bufory
+            measurementActive = 0;
+            memset(&bloodOxyBuffer, 0, sizeof(BloodOxyBuffer));
+
+            // 2. Rysuj CZERWONY EKRAN (NO WIFI)
+            BSP_LCD_Clear(LCD_COLOR_BLUE);
+            BSP_LCD_SetBackColor(LCD_COLOR_RED);
+            BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+
+            BSP_LCD_SetFont(&Font24);
+            BSP_LCD_DisplayStringAt(0, 120, (uint8_t*)"NO WIFI", CENTER_MODE);
+
+            BSP_LCD_SetFont(&Font16);
+            BSP_LCD_DisplayStringAt(0, 160, (uint8_t*)"Connection Lost...", CENTER_MODE);
+
+            while (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_1) == GPIO_PIN_RESET)
+            {
+                HAL_GPIO_TogglePin(GPIOG, LD3_Pin);
+
+                for(volatile int i=0; i<1000000; i++);
+            }
+
+            printf("!!! HARDWARE SIGNAL: WIFI RESTORED !!!\r\n");
+
+            BSP_LCD_Clear(LCD_COLOR_BLACK);
+            DrawHeader();
+            DrawBottomButtons();
+            updateScreenFlag = 1;
         }
+    }
+
+    // =========================================================
+    // 2. OBSŁUGA PRZYCISKU (PA0) - STARY KOD
+    // =========================================================
+    if (GPIO_Pin == GPIO_PIN_0) {
+		static uint32_t last_tick = 0;
+		if (HAL_GetTick() - last_tick > 200)
+		{
+			systemState = !systemState;
+
+			if (systemState) {
+				printf("SYSTEM: POWER ON\r\n");
+				HAL_GPIO_WritePin(GPIOG, LD3_Pin, GPIO_PIN_SET);
+			} else {
+				printf("SYSTEM: POWER OFF (Standby)\r\n");
+				HAL_GPIO_WritePin(GPIOG, LD3_Pin, GPIO_PIN_RESET);
+
+				measurementActive = 0;
+				memset(&bloodOxyBuffer, 0, sizeof(BloodOxyBuffer));
+			}
+
+			updateScreenFlag = 1;
+			last_tick = HAL_GetTick();
+		}
+    }
 }
 
-void myStartDefaultTask(void const * argument);
+void myStartDefaultTask(const void *argument);
 /* USER CODE END 0 */
 
 /**
@@ -289,110 +490,92 @@ int main(void)
   MX_ADC1_Init();
   MX_SPI4_Init();
   /* USER CODE BEGIN 2 */
-  #define LCD_FRAMEBUFFER       ((uint32_t)0xD0000000)
-  #define LCD_WIDTH             240
-  #define LCD_HEIGHT            320
 
-  #define COLOR_BLACK           0x0000
-  #define COLOR_WHITE           0xFFFF
-  #define COLOR_GREEN           0x07E0
-
-  LTDC_LayerCfgTypeDef pLayerCfg = {0};
-
- 
-
-  hltdc.Instance = LTDC;
-  hltdc.Init.HSPolarity        = LTDC_HSPOLARITY_AL;
-  hltdc.Init.VSPolarity        = LTDC_VSPOLARITY_AL;
-  hltdc.Init.DEPolarity        = LTDC_DEPOLARITY_AL;
-  hltdc.Init.PCPolarity        = LTDC_PCPOLARITY_IPC;
-  hltdc.Init.HorizontalSync    = 9;
-  hltdc.Init.VerticalSync      = 1;
-  hltdc.Init.AccumulatedHBP    = 29;
-  hltdc.Init.AccumulatedVBP    = 3;
-  hltdc.Init.AccumulatedActiveW = 269;
-  hltdc.Init.AccumulatedActiveH = 323;
-  hltdc.Init.TotalWidth        = 279;
-  hltdc.Init.TotalHeigh        = 327;
-  hltdc.Init.Backcolor.Blue    = 0;
-  hltdc.Init.Backcolor.Green   = 0;
-  hltdc.Init.Backcolor.Red     = 0;
-
-  RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
-  PeriphClkInitStruct.PeriphClockSelection    = RCC_PERIPHCLK_LTDC;
-  PeriphClkInitStruct.PLLSAI.PLLSAIN          = 192;
-  PeriphClkInitStruct.PLLSAI.PLLSAIR          = 4;
-  PeriphClkInitStruct.PLLSAIDivR              = RCC_PLLSAIDIVR_8;
-  HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct);
-
-  BSP_LCD_MspInit();
-
-  HAL_LTDC_Init(&hltdc);
-
-  ili9341_Init();
-
-  BSP_SDRAM_Init();
-
-  pLayerCfg.WindowX0        = 0;
-  pLayerCfg.WindowX1        = LCD_WIDTH;
-  pLayerCfg.WindowY0        = 0;
-  pLayerCfg.WindowY1        = LCD_HEIGHT;
-  pLayerCfg.PixelFormat     = LTDC_PIXEL_FORMAT_RGB565;
-  pLayerCfg.Alpha           = 255;
-  pLayerCfg.Alpha0          = 0;
-  pLayerCfg.BlendingFactor1 = LTDC_BLENDING_FACTOR1_PAxCA;
-  pLayerCfg.BlendingFactor2 = LTDC_BLENDING_FACTOR2_PAxCA;
-  pLayerCfg.FBStartAdress   = LCD_FRAMEBUFFER;
-  pLayerCfg.ImageWidth      = LCD_WIDTH;
-  pLayerCfg.ImageHeight     = LCD_HEIGHT;
-  pLayerCfg.Backcolor.Blue  = 0;
-  pLayerCfg.Backcolor.Green = 0;
-  pLayerCfg.Backcolor.Red   = 0;
-  HAL_LTDC_ConfigLayer(&hltdc, &pLayerCfg, 0);
-
-  ili9341_DisplayOn();
-  HAL_Delay(100);
-
-  uint16_t *framebuffer = (uint16_t*)LCD_FRAMEBUFFER;
-  for (uint32_t i = 0; i < (LCD_WIDTH * LCD_HEIGHT); ++i) {
-      framebuffer[i] = COLOR_BLACK;
-  }
-  HAL_Delay(50);
-
-  lcdWidth  = LCD_WIDTH;
-  lcdHeight = LCD_HEIGHT;
-  printf("LCD: %u x %u\r\n", lcdWidth, lcdHeight);
-
-  for (uint16_t y = 80; y < 80 + 60; ++y) {
-      for (uint16_t x = 20; x < 20 + 200; ++x) {
-          framebuffer[y * LCD_WIDTH + x] = COLOR_GREEN;
-      }
-  }
-
-  if (BSP_TS_Init(lcdWidth, lcdHeight) == TS_OK) {
-      printf("TS init OK\r\n");
-  } else {
-      printf("TS init ERROR\r\n");
-  }
+  HAL_GPIO_WritePin(GPIOG, LD3_Pin, GPIO_PIN_SET);
+    #define LAYER0_ADDRESS  0xD0000000
+    #define LAYER1_ADDRESS  (0xD0000000 + 0x25800)
 
 
-  BSP_LCD_Init();
+    LTDC_LayerCfgTypeDef pLayerCfg = {0};
 
-  BSP_LCD_LayerDefaultInit(0, LCD_FRAMEBUFFER);
+    BSP_LCD_MspInit();
 
-  BSP_LCD_SelectLayer(0);
+    hltdc.Instance = LTDC;
+    hltdc.Init.HSPolarity = LTDC_HSPOLARITY_AL;
+    hltdc.Init.VSPolarity = LTDC_VSPOLARITY_AL;
+    hltdc.Init.DEPolarity = LTDC_DEPOLARITY_AL;
+    hltdc.Init.PCPolarity = LTDC_PCPOLARITY_IPC;
+    hltdc.Init.HorizontalSync = 9;
+    hltdc.Init.VerticalSync = 1;
+    hltdc.Init.AccumulatedHBP = 29;
+    hltdc.Init.AccumulatedVBP = 3;
+    hltdc.Init.AccumulatedActiveW = 269;
+    hltdc.Init.AccumulatedActiveH = 323;
+    hltdc.Init.TotalWidth = 279;
+    hltdc.Init.TotalHeigh = 327;
 
-  BSP_LCD_SetBackColor(LCD_COLOR_BLACK);
-  BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
-  BSP_LCD_SetFont(&Font16);
+    hltdc.Init.Backcolor.Blue = 0;
+    hltdc.Init.Backcolor.Green = 0;
+    hltdc.Init.Backcolor.Red = 0;
 
-  HAL_Delay(10000);
+    RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
+    PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_LTDC;
+    PeriphClkInitStruct.PLLSAI.PLLSAIN = 192;
+    PeriphClkInitStruct.PLLSAI.PLLSAIR = 4;
+    PeriphClkInitStruct.PLLSAIDivR = RCC_PLLSAIDIVR_8;
+    HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct);
+
+    HAL_LTDC_Init(&hltdc);
+    ili9341_Init();
+    BSP_SDRAM_Init();
+
+
+    memset((void*)LAYER0_ADDRESS, 0, 240 * 320 * 2 * 2);
+
+
+    BSP_LCD_Init();
+    BSP_LCD_LayerDefaultInit(0, LAYER0_ADDRESS);
+    BSP_LCD_SelectLayer(0);
+    BSP_LCD_SetLayerVisible(0, ENABLE);
+    BSP_LCD_SetColorKeying(0, LCD_COLOR_BLACK);
+    HAL_LTDC_DisableColorKeying(&hltdc, 0);
+    BSP_LCD_Clear(LCD_COLOR_BLACK);
+
+
+    BSP_LCD_LayerDefaultInit(1, LAYER1_ADDRESS);
+    BSP_LCD_SelectLayer(1);
+    BSP_LCD_SetLayerVisible(1, ENABLE);
+    BSP_LCD_SetTransparency(1, 255);
+
+    HAL_LTDC_DisableColorKeying(&hltdc, 1);
+
+    ili9341_DisplayOn();
+
+    BSP_LCD_SelectLayer(1);
 
   BSP_LCD_Clear(LCD_COLOR_BLACK);
 
-  BSP_LCD_DisplayStringAt(0, 20, (uint8_t *)"BSP TEXT TEST", CENTER_MODE);
 
-  /* USER CODE END 2 */
+  BSP_LCD_SetTextColor(LCD_COLOR_RED);
+  BSP_LCD_FillRect(10, 100, 220, 120);
+
+      BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+      BSP_LCD_DrawRect(10, 100, 220, 120);
+
+      BSP_LCD_SetBackColor(LCD_COLOR_GREEN);
+      BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+
+      BSP_LCD_SetFont(&Font20);
+
+      BSP_LCD_DisplayStringAt(0, 130, (uint8_t*)"SYSTEM START UP", CENTER_MODE);
+
+      BSP_LCD_SetFont(&Font16);
+      BSP_LCD_DisplayStringAt(0, 160, (uint8_t*)"Please wait...", CENTER_MODE);
+
+      if (BSP_TS_Init(240, 320) == TS_OK) {
+          printf("TS init OK\r\n");
+      }
+    /* USER CODE END 2 */
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
@@ -408,6 +591,18 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
+  osMessageQDef(ecgQueue, 64, int32_t);
+  ecgQueueHandle = osMessageCreate(osMessageQ(ecgQueue), NULL);
+
+  osMessageQDef(tempQueue, 1, uint32_t);
+  tempQueueHandle = osMessageCreate(osMessageQ(tempQueue), NULL);
+
+  osMessageQDef(oxyQueue, 1, uint32_t);
+  oxyQueueHandle = osMessageCreate(osMessageQ(oxyQueue), NULL);
+
+  osMessageQDef(gsrQueue, 1, uint32_t);
+  gsrQueueHandle = osMessageCreate(osMessageQ(gsrQueue), NULL);
+
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -930,7 +1125,7 @@ static void MX_UART5_Init(void)
 
   /* USER CODE END UART5_Init 1 */
   huart5.Instance = UART5;
-  huart5.Init.BaudRate = 9600;
+  huart5.Init.BaudRate = 115200;
   huart5.Init.WordLength = UART_WORDLENGTH_8B;
   huart5.Init.StopBits = UART_STOPBITS_1;
   huart5.Init.Parity = UART_PARITY_NONE;
@@ -1130,134 +1325,253 @@ static void MX_GPIO_Init(void)
   HAL_NVIC_EnableIRQ(EXTI0_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-  GPIO_InitStruct.Pin = GPIO_PIN_1; // Upewnij się, że to właściwy Pin (nie ten sam co CS!)
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING; // MAX30003 generuje sygnał aktywny niski
-  GPIO_InitStruct.Pull = GPIO_PULLUP;          // Warto dodać Pull-Up dla stabilności
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  GPIO_InitStruct.Pin = GPIO_PIN_1; // Używamy PC1
+	GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING; // Reaguj na zmianę 0->1 i 1->0
+	GPIO_InitStruct.Pull = GPIO_PULLDOWN; // Domyślnie w dół (jeśli kabel się urwie to brak wifi)
+	HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-
-  GPIO_InitStruct.Pin = MAX30003_CS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(MAX30003_CS_GPIO_Port, &GPIO_InitStruct);
-  HAL_GPIO_WritePin(MAX30003_CS_GPIO_Port, MAX30003_CS_Pin, GPIO_PIN_SET);
+	// 3. Włącz przerwanie w NVIC (kontroler przerwań)
+	// PC1 korzysta z linii EXTI1
+	HAL_NVIC_SetPriority(EXTI1_IRQn, 0, 0); // Najwyższy priorytet!
+	HAL_NVIC_EnableIRQ(EXTI1_IRQn);
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
 
-void StartTouchTask(void const * argument)
+void DrawHeader(void)
+{
+    BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+    BSP_LCD_FillRect(0, 0, 240, 32);
+
+    BSP_LCD_SetBackColor(LCD_COLOR_BLACK);
+    BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+    BSP_LCD_SetFont(&Font16);
+
+    switch (currentSensor)
+    {
+        case 0:
+            BSP_LCD_DisplayStringAt(0, 10, (uint8_t *)"Thermometer", CENTER_MODE);
+            break;
+        case 1:
+            BSP_LCD_DisplayStringAt(0, 10, (uint8_t *)"SpO2 & HR", CENTER_MODE);
+            break;
+        case 2:
+            BSP_LCD_DisplayStringAt(0, 10, (uint8_t *)"Stress Level", CENTER_MODE);
+            break;
+        case 3:
+            BSP_LCD_DisplayStringAt(0, 10, (uint8_t *)"Live ECG", CENTER_MODE);
+            break;
+    }
+
+    BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+    BSP_LCD_DrawHLine(0, 32, 240);
+
+    BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+}
+
+void DrawBottomButtons(void)
+{
+    BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+    BSP_LCD_FillRect(0, BUTTON_AREA_Y_START, 240, BUTTON_HEIGHT);
+
+    BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+    BSP_LCD_DrawVLine(80, BUTTON_AREA_Y_START, BUTTON_HEIGHT);
+    BSP_LCD_DrawVLine(160, BUTTON_AREA_Y_START, BUTTON_HEIGHT);
+
+    BSP_LCD_DrawHLine(0, BUTTON_AREA_Y_START, 240);
+
+    BSP_LCD_SetBackColor(LCD_COLOR_BLACK);
+    BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+    BSP_LCD_SetFont(&Font16);
+
+    BSP_LCD_DisplayStringAt(11, BUTTON_AREA_Y_START + 15, (uint8_t *)"< PREV", LEFT_MODE);
+
+    if (measurementActive) {
+        BSP_LCD_SetTextColor(LCD_COLOR_RED);
+        BSP_LCD_DisplayStringAt(4, BUTTON_AREA_Y_START + 15, (uint8_t *)"STOP", CENTER_MODE);
+    } else {
+        BSP_LCD_SetTextColor(LCD_COLOR_GREEN);
+        BSP_LCD_DisplayStringAt(4, BUTTON_AREA_Y_START + 15, (uint8_t *)"START", CENTER_MODE);
+    }
+
+    BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+
+    BSP_LCD_DisplayStringAt(0, BUTTON_AREA_Y_START + 15, (uint8_t *)"NEXT >", RIGHT_MODE);
+}
+
+void StartTouchTask(const void *argument)
 {
     TS_StateTypeDef ts;
-    uint8_t lastTouch = 0;
+    uint8_t wasTouched = 0;
 
     printf("Touch task started\r\n");
-    osDelay(200);
+    osDelay(500);
 
     for (;;)
     {
+
         BSP_TS_GetState(&ts);
 
-        if (ts.TouchDetected && !lastTouch)
+        if (ts.TouchDetected)
         {
-            uint16_t x = ts.X;
-            uint16_t y = ts.Y;
+            if (!wasTouched)
+            {
+                uint16_t y = 320 - ts.Y;
+                uint16_t x = 240 - ts.X;
 
-            printf("Touch: X=%u Y=%u\r\n", x, y);
-            currentSensor = (currentSensor + 1) % 3;
-            printf("Sensor changed to %d\r\n", currentSensor);
+                if (y >= BUTTON_AREA_Y_START)
+                {
+                    if (x < 80)
+                    {
+                        currentSensor = (currentSensor + 1) % 4;
+                        printf("BTN: PREV -> Sensor %d\r\n", currentSensor);
+
+                        memset(&bloodOxyBuffer, 0, sizeof(BloodOxyBuffer));
+                    }
+                    else if (x < 160)
+                    {
+                        measurementActive = !measurementActive;
+                        printf("BTN: %s\r\n", measurementActive ? "START" : "STOP");
+
+                        if (measurementActive == 0) {
+                            memset(&bloodOxyBuffer, 0, sizeof(BloodOxyBuffer));
+                        }
+                    }
+                    else
+                    {
+                        currentSensor = (currentSensor + 3) % 4;
+                        printf("BTN: NEXT -> Sensor %d\r\n", currentSensor);
+
+                        memset(&bloodOxyBuffer, 0, sizeof(BloodOxyBuffer));
+                    }
+
+                    updateScreenFlag = 1;
+                }
+            }
+            wasTouched = 1;
         }
-
-        lastTouch = ts.TouchDetected ? 1 : 0;
+        else
+        {
+            wasTouched = 0;
+        }
 
         osDelay(50);
     }
 }
-
 void RequestRTCfromESP32(void)
 {
     const char* request = "GET_RTC\n";
-    uint8_t rxBuffer[64] = {0};
+    uint8_t rxBuffer[128]; // Zwiększony bufor dla bezpieczeństwa
     uint8_t ch;
-    int idx = 0;
 
-    // Wyślij żądanie
-    HAL_UART_Transmit(&huart5, (uint8_t*)request, strlen(request), HAL_MAX_DELAY);
-    printf("Requesting RTC from ESP32...\r\n");
+    rtc_base_time = 0;
 
-    uint8_t dump;
-    while (HAL_UART_Receive(&huart5, &dump, 1, 5) == HAL_OK);
+    printf("--- RTC SYNC START ---\r\n");
 
-    osDelay(100);
+    while (rtc_base_time == 0)
+    {
+        // 1. Czyścimy bufor sprzętowy (wywalamy stare śmieci)
+        uint8_t dump;
+        while (HAL_UART_Receive(&huart5, &dump, 1, 2) == HAL_OK);
 
-    // Czytaj znak po znaku aż do \n lub timeout
-    uint32_t start = HAL_GetTick();
-    while ((HAL_GetTick() - start) < 5000 && idx < sizeof(rxBuffer) - 1) {
-        if (HAL_UART_Receive(&huart5, &ch, 1, 100) == HAL_OK) {
-            rxBuffer[idx++] = ch;
-            if (ch == '\n') break;
+        // 2. Czyścimy bufor programowy
+        memset(rxBuffer, 0, sizeof(rxBuffer));
+        int idx = 0;
+
+        // --- ZMIANA: Printf PRZED wysłaniem, żeby nie blokował odbioru ---
+        printf("Sending GET_RTC...\r\n");
+
+        // 3. Wysyłamy żądanie
+        HAL_UART_Transmit(&huart5, (uint8_t*)request, strlen(request), HAL_MAX_DELAY);
+
+        // --- TU NIE MOŻE BYĆ ŻADNEGO PRINTFA ANI DELAYA! ---
+        // STM32 musi natychmiast nasłuchiwać odpowiedzi
+
+        // 4. Odbieramy odpowiedź
+        uint32_t start = HAL_GetTick();
+        while ((HAL_GetTick() - start) < 2000 && idx < sizeof(rxBuffer) - 1) {
+            // Krótki timeout na znak (10ms), długi na całą pętlę
+            if (HAL_UART_Receive(&huart5, &ch, 1, 10) == HAL_OK) {
+                // Ignorujemy puste znaki na początku (czyszczenie linii)
+                if (idx == 0 && (ch == '\r' || ch == '\n' || ch == 0)) continue;
+
+                rxBuffer[idx++] = ch;
+                if (ch == '\n') break; // Koniec linii
+            }
         }
-    }
+        rxBuffer[idx] = '\0';
 
-    rxBuffer[idx] = '\0';  // null-terminate
+        // 5. Analiza danych
+        if (idx > 5) { // Jeśli przyszło coś sensownego (więcej niż kilka znaków)
+            printf("RX: %s", rxBuffer);
 
-    if (idx > 0) {
-    	printf("Received raw bytes: ");
-    	for (int i = 0; i < idx; i++) {
-    	    printf("[%02X]", rxBuffer[i]);
-    	}
-    	printf("\r\n");
-        char *ptr = strstr((char*)rxBuffer, "\"rtc\":");
-        if (ptr) {
-        	const char* ack = "ACK\r\n";
-			HAL_UART_Transmit(&huart5, (uint8_t*)ack, strlen(ack), HAL_MAX_DELAY);
-            rtc_base_time = atoi(ptr + 6);
-            printf("RTC base time received: %lu\r\n", rtc_base_time);
+            char *ptr = strstr((char*)rxBuffer, "\"rtc\":");
+            if (ptr) {
+                uint32_t temp_time = atoi(ptr + 6);
 
+                if (temp_time > 1600000000) {
+                    rtc_base_time = temp_time;
+                    printf("SUCCESS! RTC synced: %lu\r\n", rtc_base_time);
+
+                    const char* ack = "ACK\r\n";
+                    HAL_UART_Transmit(&huart5, (uint8_t*)ack, strlen(ack), HAL_MAX_DELAY);
+                    return; // SUKCES - WYCHODZIMY
+                } else {
+                    printf("Time invalid. Retrying...\r\n");
+                }
+            } else {
+                printf("JSON format error. Retrying...\r\n");
+            }
         } else {
-            printf("RTC format invalid.\r\n");
+            printf("Timeout. Retrying...\r\n");
         }
-    } else {
-        printf("Timeout: no response from ESP32.\r\n");
+
+        osDelay(2000); // Dłuższa przerwa przed kolejną próbą
     }
 }
-// Zmienne do rysowania wykresu
-    static uint16_t graphX = 0;      // Pozycja pozioma
-    static uint16_t lastGraphY = 160; // Poprzednia pozycja pionowa (startujemy na środku)
 
-    // Parametry ekranu (sprawdź czy pasują do Twojej orientacji)
-    #define GRAPH_H_CENTER 160       // Połowa wysokości (320 / 2)
-    #define GRAPH_MAX_X    240       // Szerokość ekranu
-    #define GRAPH_SCALE    30
 
-void MAX30003_ReadRegBurst(uint8_t reg, uint8_t *pData, uint8_t count)
+#define ECG_BATCH_SIZE 50 // Wysyłamy co 50 próbek
+static int32_t ecgBatchBuffer[ECG_BATCH_SIZE];
+static uint16_t ecgBatchIndex = 0;
+
+// Bufor na JSON (50 liczb * ~5 cyfr + nagłówek)
+char ecgTxBuffer[512];
+
+void myStartDefaultTask(const void *argument)
 {
-    // Komenda odczytu: (Adres << 1) | 1
-    uint8_t txData = (reg << 1) | 0x01;
-
-    // 1. Chip Select LOW (Aktywacja) - ZMIEŃ PIN I PORT NA SWÓJ!
-    // Poniżej przykład dla CS na PD14, sprawdź jak masz u siebie
-    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_RESET);
-
-    // 2. Wyślij adres rejestru
-    // ZMIEŃ &hspi1 NA SWÓJ UCHWYT (np. &hspi2, &hspi4)
-    HAL_SPI_Transmit(&hspi4, &txData, 1, 10);
-
-    // 3. Odbierz 'count' bajtów danych
-    HAL_SPI_Receive(&hspi4, pData, count, 10);
-
-    // 4. Chip Select HIGH (Dezaktywacja)
-    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);
-}
-
-void myStartDefaultTask(void const * argument)
-{
-    osDelay(1000);
+	osDelay(2000);
     const char* hello = "HELLO STM32 UART5\r\n";
     HAL_UART_Transmit(&huart5, (uint8_t*)hello, strlen(hello), HAL_MAX_DELAY);
     osDelay(200);
     RequestRTCfromESP32();
+    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_1) == GPIO_PIN_RESET)
+        {
+            printf("STARTUP CHECK: NO WIFI SIGNAL DETECTED!\r\n");
+
+            // Rysuj Czerwony Ekran
+            BSP_LCD_Clear(LCD_COLOR_BLACK);
+            BSP_LCD_SetBackColor(LCD_COLOR_RED);
+            BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+            BSP_LCD_SetFont(&Font24);
+            BSP_LCD_DisplayStringAt(0, 120, (uint8_t*)"NO WIFI", CENTER_MODE);
+            BSP_LCD_SetFont(&Font16);
+            BSP_LCD_DisplayStringAt(0, 160, (uint8_t*)"Check Connection...", CENTER_MODE);
+
+            // Zablokuj system dopóki nie pojawi się stan WYSOKI (WiFi wróci)
+            while (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_1) == GPIO_PIN_RESET)
+            {
+                HAL_GPIO_TogglePin(GPIOG, LD3_Pin); // Miganie diodą
+                osDelay(200); // Tutaj możemy użyć osDelay bo nie jesteśmy w przerwaniu
+            }
+
+            // WiFi wróciło - czyścimy ekran i idziemy dalej
+            printf("STARTUP CHECK: WIFI DETECTED!\r\n");
+            BSP_LCD_Clear(LCD_COLOR_BLACK);
+            DrawHeader();
+            DrawBottomButtons();
+        }
 
     printf("Board powering on and starting tasks\r\n");
 
@@ -1275,7 +1589,7 @@ void myStartDefaultTask(void const * argument)
     }
     MAX30003_Init(&max30003, &hspi4, MAX30003_CS_GPIO_Port, MAX30003_CS_Pin);
 
-    HAL_Delay(100); // <--- DODAJ TO, żeby ID Error zniknął
+    HAL_Delay(100);
 
 
 	if (!MAX30003_ReadDeviceID(&max30003)) {
@@ -1283,276 +1597,269 @@ void myStartDefaultTask(void const * argument)
 	} else {
 		printf("MAX30003 ready\r\n");
 	}
-	static float hp_baseline = 0.0f;
-	static float lp_state = 0.0f;
 
-	const float fs = 128.0f;
-	const float dt = 1.0f / fs;
-
-	// High-pass ~0.5 Hz
-	const float fc_hp = 0.5f;
-	const float RC_hp = 1.0f / (2.0f * 3.14159f * fc_hp);
-	const float alpha_hp = dt / (RC_hp + dt);
-
-	// Low-pass ~25 Hz
-	const float fc_lp = 25.0f;
-	const float RC_lp = 1.0f / (2.0f * 3.14159f * fc_lp);
-	const float alpha_lp = dt / (RC_lp + dt);
+	systemStartupComplete = 1;
+	measurementActive = 0;
+	DrawBottomButtons();
 
     char uart5Msg[128];
-    for (;;) {
-        switch (currentSensor) {
 
-        case 0:
-            if (MLX90614_ReadAmbientTemp(&mlxData.ambient) == HAL_OK) {
-                if (MLX90614_ReadObjectTemp(&mlxData.object) != HAL_OK) {
-                    printf("MLX90614 object read failed\r\n");
-                    mlxData.object = 0.0f;
+        for (;;) {
+
+        	if (measurementActive == 0) {
+    			osDelay(100);
+    			continue;
+    		}
+
+            switch (currentSensor) {
+
+            // ====================================================================
+            // CASE 0: TEMPERATURA
+            // ====================================================================
+            case 0:
+                if (MLX90614_ReadAmbientTemp(&mlxData.ambient) == HAL_OK) {
+                    if (MLX90614_ReadObjectTemp(&mlxData.object) != HAL_OK) {
+                        mlxData.object = 0.0f;
+                    }
+                    osMessagePut(tempQueueHandle, (uint32_t)&mlxData, 0);
+
+                    uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
+                    char payload[64];
+                    snprintf(payload, sizeof(payload),
+                             "{\"timestamp\":%lu,\"ambient\":%.2f,\"object\":%.2f}",
+                             timestamp, mlxData.ambient, mlxData.object);
+
+                    uint8_t crc = calcChecksum(payload, strlen(payload));
+                    snprintf(uart5Msg, sizeof(uart5Msg), "%s,\"crc\":%d}\r\n", payload, crc);
+
+                    printf("Timestamp: %lu, Ambient: %.2f C, Object: %.2f C, CRC: %d\r\n",
+                           timestamp, mlxData.ambient, mlxData.object, crc);
+
+                    // --- POPRAWIONA PĘTLA RETRY ---
+                    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+                        printf("Sent (try %d): %s", attempt + 1, uart5Msg);
+
+                        // 1. Wysyłamy
+                        HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+
+                        // 2. Czekamy na ACK (500ms timeout)
+                        if (waitForAck(&huart5, 500)) {
+                            printf("ACK received\r\n\n");
+                            break; // Sukces, wychodzimy z pętli
+                        } else {
+                            printf("NACK or Timeout. Retrying...\r\n");
+                            osDelay(100); // Krótka przerwa przed ponowieniem
+                        }
+                    }
+                    // ------------------------------
+
+                } else {
+                    printf("Temperature read error\r\n");
                 }
+                osDelay(2000);
+                break;
+
+            // ====================================================================
+            // CASE 1: SPO2 i PULS
+            // ====================================================================
+            case 1:
+            {
+                BoodOxyData tempData;
+                if (BoodOxy_GetHeartbeatSPO2(&tempData) == HAL_OK) {
+                    oxyData = tempData;
+
+                    if (tempData.spo2 > 0 && tempData.spo2 <= 100 &&
+                        tempData.heartbeat > 0 && tempData.heartbeat <= 250) {
+
+                        for (int i = BLOOD_OXY_BUFFER_SIZE - 1; i > 0; i--) {
+                            bloodOxyBuffer.spo2_values[i] = bloodOxyBuffer.spo2_values[i-1];
+                            bloodOxyBuffer.hr_values[i] = bloodOxyBuffer.hr_values[i-1];
+                        }
+                        bloodOxyBuffer.spo2_values[0] = tempData.spo2;
+                        bloodOxyBuffer.hr_values[0] = tempData.heartbeat;
+
+                        if (bloodOxyBuffer.valid_count < BLOOD_OXY_BUFFER_SIZE) {
+                            bloodOxyBuffer.valid_count++;
+                        }
+                    }
+
+                    if (bloodOxyBuffer.valid_count >= 3) {
+                        int32_t avg_spo2 = 0;
+                        int32_t avg_hr = 0;
+                        for (int i = 0; i < 3; i++) {
+                            avg_spo2 += bloodOxyBuffer.spo2_values[i];
+                            avg_hr += bloodOxyBuffer.hr_values[i];
+                        }
+                        avg_spo2 /= 3;
+                        avg_hr /= 3;
+                        oxyData.spo2 = avg_spo2;
+    					oxyData.heartbeat = avg_hr;
+
+    					osMessagePut(oxyQueueHandle, (uint32_t)&oxyData, 0);
+
+                        uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
+                        char payload[64];
+                        snprintf(payload, sizeof(payload),
+                                 "{\"timestamp\":%lu,\"spo2\":%ld,\"hr\":%ld}",
+                                 timestamp, avg_spo2, avg_hr);
+
+                        uint8_t crc = calcChecksum(payload, strlen(payload));
+                        snprintf(uart5Msg, sizeof(uart5Msg), "%s,\"crc\":%d}\r\n", payload, crc);
+
+                        printf("Timestamp: %lu, SpO2: %ld%%, HR: %ld bpm, CRC: %d\r\n",
+                               timestamp, avg_spo2, avg_hr, crc);
+
+                        // --- POPRAWIONA PĘTLA RETRY ---
+                        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+                            printf("Sent (try %d): %s", attempt + 1, uart5Msg);
+
+                            HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+
+                            if (waitForAck(&huart5, 500)) {
+                                printf("ACK received\r\n\n");
+                                break;
+                            } else {
+                                printf("NACK or Timeout. Retrying...\r\n");
+                                osDelay(100);
+                            }
+                        }
+                        // ------------------------------
+                        osDelay(5000); // Dłuższa przerwa po udanym pomiarze
+                    } else {
+                        printf("Waiting for more valid samples (%d/3)...\r\n", bloodOxyBuffer.valid_count);
+                        osDelay(1000);
+                    }
+                } else {
+                    printf("BloodOxy read error\r\n");
+                    osDelay(1000);
+                }
+                osDelay(2000);
+                break;
+            }
+
+            // ====================================================================
+            // CASE 2: GSR (STRES)
+            // ====================================================================
+            case 2:
+            {
+                ADC_ChannelConfTypeDef sConfig = {0};
+                sConfig.Channel = ADC_CHANNEL_13;
+                sConfig.Rank = 1;
+                sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
+
+                if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) { Error_Handler(); }
+
+                uint32_t gsrSum = 0;
+                for (int i = 0; i < 10; i++) {
+                    HAL_ADC_Start(&hadc1);
+                    if (HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY) == HAL_OK) {
+                        gsrSum += HAL_ADC_GetValue(&hadc1);
+                    }
+                }
+                uint32_t gsrAvg = gsrSum / 10;
+
+                const char* mood = "Unknown";
+                if (gsrAvg < 600) mood = "Stressed";
+                else if (gsrAvg >= 600 && gsrAvg <= 1000) mood = "Neutral";
+                else mood = "Relaxed";
+
+                strncpy((char*)gsrData.mood, mood, 16);
+                gsrData.value = gsrAvg;
+                osMessagePut(gsrQueueHandle, (uint32_t)&gsrData, 0);
 
                 uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
-                char payload[64];
+                char payload[96];
                 snprintf(payload, sizeof(payload),
-                         "{\"timestamp\":%lu,\"ambient\":%.2f,\"object\":%.2f}",
-                         timestamp, mlxData.ambient, mlxData.object);
+                         "{\"timestamp\":%lu,\"gsr\":%lu,\"mood\":\"%s\"}",
+                         timestamp, gsrAvg, mood);
 
                 uint8_t crc = calcChecksum(payload, strlen(payload));
-                printf("Timestamp: %lu, Ambient: %.2f C, Object: %.2f C, CRC: %d\r\n",
-                       timestamp, mlxData.ambient, mlxData.object, crc);
+                snprintf(uart5Msg, sizeof(uart5Msg), "%s,\"crc\":%d}\r\n", payload, crc);
 
-                snprintf(uart5Msg, sizeof(uart5Msg),
-                         "%s,\"crc\":%d}\r\n", payload, crc);
+                printf("Timestamp: %lu, GSR: %lu, Mood: %s, CRC: %d\r\n", timestamp, gsrAvg, mood, crc);
 
-                HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
+                // --- POPRAWIONA PĘTLA RETRY ---
                 for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-                    if (attempt == 0) osDelay(10);
-                    HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
                     printf("Sent (try %d): %s", attempt + 1, uart5Msg);
+
+                    HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
 
                     if (waitForAck(&huart5, 500)) {
                         printf("ACK received\r\n\n");
                         break;
                     } else {
-                        printf("NACK or no response — retrying...\r\n");
+                        printf("NACK or Timeout. Retrying...\r\n");
+                        osDelay(100);
                     }
                 }
-            } else {
-                printf("Temperature read error\r\n");
+                // ------------------------------
             }
-            osDelay(5000);
+            osDelay(1000);
             break;
 
-        case 1:
-        {
-            BoodOxyData tempData;
-            if (BoodOxy_GetHeartbeatSPO2(&tempData) == HAL_OK) {
-                oxyData = tempData;
+            // ====================================================================
+            // CASE 3: EKG (STREAMING)
+            // ====================================================================
+            case 3:
+            {
+                uint32_t status = MAX30003_ReadReg(&max30003, 0x01);
 
-                if (tempData.spo2 > 0 && tempData.spo2 <= 100 &&
-                    tempData.heartbeat > 0 && tempData.heartbeat <= 250) {
+                if (status & 0x800000) { // Dane dostępne
+                    int32_t ecg_val;
+                    while(MAX30003_GetECG_Sample(&max30003, &ecg_val)) {
 
-                    for (int i = BLOOD_OXY_BUFFER_SIZE - 1; i > 0; i--) {
-                        bloodOxyBuffer.spo2_values[i] = bloodOxyBuffer.spo2_values[i-1];
-                        bloodOxyBuffer.hr_values[i] = bloodOxyBuffer.hr_values[i-1];
-                    }
+                        osMessagePut(ecgQueueHandle, ecg_val, 0); // Wykres
 
-                    bloodOxyBuffer.spo2_values[0] = tempData.spo2;
-                    bloodOxyBuffer.hr_values[0] = tempData.heartbeat;
-
-                    if (bloodOxyBuffer.valid_count < BLOOD_OXY_BUFFER_SIZE) {
-                        bloodOxyBuffer.valid_count++;
-                    }
-
-                    bloodOxyBuffer.last_valid_spo2 = tempData.spo2;
-                    bloodOxyBuffer.last_valid_hr = tempData.heartbeat;
-                }
-
-                if (bloodOxyBuffer.valid_count >= 3) {
-                    int32_t avg_spo2 = 0;
-                    int32_t avg_hr = 0;
-                    for (int i = 0; i < 3; i++) {
-                        avg_spo2 += bloodOxyBuffer.spo2_values[i];
-                        avg_hr += bloodOxyBuffer.hr_values[i];
-                    }
-                    avg_spo2 /= 3;
-                    avg_hr /= 3;
-
-                    uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
-                    char payload[64];
-                    snprintf(payload, sizeof(payload),
-                             "{\"timestamp\":%lu,\"spo2\":%ld,\"hr\":%ld}",
-                             timestamp, avg_spo2, avg_hr);
-
-                    uint8_t crc = calcChecksum(payload, strlen(payload));
-                    printf("Timestamp: %lu, SpO2: %ld%%, HR: %ld bpm, CRC: %d\r\n",
-                           timestamp, avg_spo2, avg_hr, crc);
-
-                    snprintf(uart5Msg, sizeof(uart5Msg),
-                             "%s,\"crc\":%d}\r\n", payload, crc);
-
-                    HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
-                    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-                        if (attempt == 0) osDelay(10);
-                        HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
-                        printf("Sent (try %d): %s", attempt + 1, uart5Msg);
-
-                        if (waitForAck(&huart5, 500)) {
-                            printf("ACK received\r\n\n");
-                            break;
-                        } else {
-                            printf("NACK or no response — retrying...\r\n");
+                        if (ecgBatchIndex < ECG_BATCH_SIZE) {
+                            ecgBatchBuffer[ecgBatchIndex++] = ecg_val;
                         }
-                    }
-                    osDelay(5000);
-                } else {
-                    printf("Waiting for more valid samples (%d/3)...\r\n", bloodOxyBuffer.valid_count);
-                    osDelay(1000);
-                }
-            } else {
-                printf("BloodOxy read error\r\n");
-                osDelay(1000);
-            }
-            break;
-        }
 
-        case 2:
-        {
-            ADC_ChannelConfTypeDef sConfig = {0};
-            sConfig.Channel = ADC_CHANNEL_13;
-            sConfig.Rank = 1;
-            sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
+                        // WYSYŁKA PACZKI
+                        if (ecgBatchIndex >= ECG_BATCH_SIZE) {
+                            uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
 
-            if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
-                Error_Handler();
-            }
-
-            uint32_t gsrSum = 0;
-            for (int i = 0; i < 10; i++) {
-                HAL_ADC_Start(&hadc1);
-                if (HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY) == HAL_OK) {
-                    gsrSum += HAL_ADC_GetValue(&hadc1);
-                }
-            }
-            uint32_t gsrAvg = gsrSum / 10;
-
-            const char* mood = "Unknown";
-            if (gsrAvg < 400) {
-                mood = "Stressed";
-            } else if (gsrAvg >= 400 && gsrAvg <= 1000) {
-                mood = "Neutral";
-            } else {
-                mood = "Relaxed";
-            }
-
-            uint32_t timestamp = rtc_base_time + HAL_GetTick() / 1000;
-            char payload[96];
-            snprintf(payload, sizeof(payload),
-                     "{\"timestamp\":%lu,\"gsr\":%lu,\"mood\":\"%s\"}",
-                     timestamp, gsrAvg, mood);
-
-            uint8_t crc = calcChecksum(payload, strlen(payload));
-            snprintf(uart5Msg, sizeof(uart5Msg), "%s,\"crc\":%d}\r\n", payload, crc);
-
-            printf("Timestamp: %lu, GSR: %lu, Mood: %s, CRC: %d\r\n",
-                   timestamp, gsrAvg, mood, crc);
-
-            HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
-
-            for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-                if (attempt == 0) osDelay(10);
-                HAL_UART_Transmit(&huart5, (uint8_t*)uart5Msg, strlen(uart5Msg), HAL_MAX_DELAY);
-                printf("Sent (try %d): %s", attempt + 1, uart5Msg);
-
-                if (waitForAck(&huart5, 500)) {
-                    printf("ACK received\r\n\n");
-                    break;
-                } else {
-                    printf("NACK or no response — retrying...\r\n");
-                }
-            }
-        }
-        osDelay(1000);
-        break;
-//        case 3:
-//                {
-//                    // Czekamy na flagę z przerwania
-//                    if (ecgDataReady)
-//                    {
-//                         ecgDataReady = 0; // Kasujemy flagę
-//
-//                         // Pobierz próbkę (bez sprawdzania rejestru statusu po SPI, bo wiemy że jest)
-//                         int32_t raw = MAX30003_GetECG(&maxCtx);
-//
-//                         // --- FILTRACJA ---
-//                         float x = (float)raw;
-//                         hp_baseline = hp_baseline + alpha_hp * (x - hp_baseline);
-//                         float hp = x - hp_baseline;
-//                         lp_state = lp_state + alpha_lp * (hp - lp_state);
-//
-//                         float filtered_val = lp_state;
-//
-//                         // Wyślij do Serial Plottera
-//                         printf("%ld, %.2f\r\n", raw, filtered_val);
-//                    }
-//                    break;
-//                }
-        case 3: // EKG MAX30003
-                {
-                    uint32_t status = MAX30003_ReadReg(&max30003, 0x01);
-
-                    // Obsługa przepełnienia (Standard)
-                    if (status & 0x400000) {
-                        MAX30003_WriteReg(&max30003, 0x00, 0x000000);
-                        MAX30003_WriteReg(&max30003, 0x09, 0x000000);
-                    }
-
-                    if (status & 0x800000) {
-                        int32_t ecg_val;
-
-                        // Pętla pobiera wszystkie dostępne próbki
-                        while(MAX30003_GetECG_Sample(&max30003, &ecg_val)) {
-
-                            // 1. SKALOWANIE: Dopasuj surowe dane do ekranu
-                            // Odejmujemy ecg_val, bo na LCD Y rośnie w dół, a chcemy górę na górze
-                            // Dzielimy przez GRAPH_SCALE, żeby zmniejszyć amplitudę
-                            int16_t newY = GRAPH_H_CENTER - (ecg_val / GRAPH_SCALE);
-
-                            // 2. Ograniczenie (Clamping) - żeby nie rysować poza ekranem
-                            if (newY < 0) newY = 0;
-                            if (newY > 319) newY = 319; // Zakładając wysokość 320
-
-                            // 3. RYSOWANIE "KASOWNIKA" (Eraser Bar)
-                            // Czyścimy wąski pasek przed wykresem, żeby usunąć stare dane
-                            BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
-                            BSP_LCD_DrawLine(graphX + 1, 0, graphX + 1, 320); // Czyścimy linię przed nami
-
-                            // 4. RYSOWANIE LINII SYGNAŁU
-                            // Łączymy poprzedni punkt z nowym
-                            BSP_LCD_SetTextColor(LCD_COLOR_GREEN); // Kolor EKG
-                            BSP_LCD_DrawLine(graphX, lastGraphY, graphX + 1, newY);
-
-                            // 5. AKTUALIZACJA POZYCJI
-                            lastGraphY = newY; // Zapamiętaj Y dla następnej linii
-                            graphX++;          // Przesuń się w prawo
-
-                            // 6. ZAWIJANIE (Oscyloskop)
-                            if (graphX >= (GRAPH_MAX_X - 2)) {
-                                graphX = 0; // Wróć na początek
-                                // Opcjonalnie: lastGraphY = newY; // Żeby nie było krechy przez cały ekran przy powrocie
+                            // Budowanie JSON
+                            int len = snprintf(ecgTxBuffer, sizeof(ecgTxBuffer), "{\"timestamp\":%lu,\"ecg\":[", timestamp);
+                            for (int i = 0; i < ECG_BATCH_SIZE; i++) {
+                                if (len >= sizeof(ecgTxBuffer) - 20) break;
+                                len += snprintf(ecgTxBuffer + len, sizeof(ecgTxBuffer) - len, "%ld%s", ecgBatchBuffer[i], (i < ECG_BATCH_SIZE - 1) ? "," : "");
                             }
+                            len += snprintf(ecgTxBuffer + len, sizeof(ecgTxBuffer) - len, "]}");
 
-                            // (Opcjonalnie) Nadal wypisuj na UART, żebyś miał podgląd w komputerze
-                            // printf("%ld\r\n", ecg_val);
+                            uint8_t crc = calcChecksum(ecgTxBuffer, len);
+                            snprintf(ecgTxBuffer + len, sizeof(ecgTxBuffer) - len, ",\"crc\":%d}\r\n", crc);
+
+                            // --- WYSYŁKA EKG Z RETRY ---
+                            // Dla EKG retry jest ryzykowne (może zatkać bufor), ale spróbujmy raz lub dwa
+                            for (int attempt = 0; attempt < 2; attempt++) {
+                                HAL_UART_Transmit(&huart5, (uint8_t*)ecgTxBuffer, strlen(ecgTxBuffer), HAL_MAX_DELAY);
+
+                                // Krótszy timeout dla EKG, bo to strumień
+                                if (waitForAck(&huart5, 200)) {
+                                    break;
+                                }
+                                // Jeśli NACK, próbujemy jeszcze raz (pętla)
+                            }
+                            // ---------------------------
+
+                            ecgBatchIndex = 0; // Reset bufora
                         }
                     }
-
-                    osDelay(5); // Krótkie opóźnienie
-                    break;
                 }
 
-                } // End switch
-            } // End for
-        } // En
+                // Obsługa błędu FIFO
+                if (status & 0x400000) {
+                    MAX30003_WriteReg(&max30003, 0x00, 0x000000);
+                    MAX30003_WriteReg(&max30003, 0x09, 0x000000);
+                    ecgBatchIndex = 0;
+                }
+                osDelay(2);
+                break;
+            }
+
+    		} // End Switch
+    	} // End For
+}
 
 uint8_t calcChecksum(const char* str, size_t len) {
     uint8_t sum = 0;
@@ -1564,30 +1871,54 @@ uint8_t calcChecksum(const char* str, size_t len) {
 
 
 bool waitForAck(UART_HandleTypeDef* uart, uint32_t timeout_ms) {
-    uint8_t dummy;
-    while (HAL_UART_Receive(uart, &dummy, 1, 1) == HAL_OK);
+    // !!! WAŻNE: USUWAMY CZYSZCZENIE BUFORA !!!
+    // ESP32 jest teraz tak szybkie, że ACK już tu prawdopodobnie czeka w buforze sprzętowym STM32.
+    // Jeśli zrobimy flush/read dummy, to skasujemy właściwy ACK.
 
     uint8_t ch;
-    char ackBuf[16] = {0};
+    char ackBuf[32] = {0}; // Zwiększyłem bufor
     int idx = 0;
     uint32_t start = HAL_GetTick();
 
-    while ((HAL_GetTick() - start) < timeout_ms && idx < sizeof(ackBuf) - 1) {
-        if (HAL_UART_Receive(uart, &ch, 1, 10) == HAL_OK) {
+    while ((HAL_GetTick() - start) < timeout_ms) {
+        // Krótki timeout na znak, żeby nie blokować pętli, ale pętla główna trwa timeout_ms
+        if (HAL_UART_Receive(uart, &ch, 1, 5) == HAL_OK) {
+
+            // Ignorujemy znak powrotu karetki '\r'
             if (ch == '\r') continue;
-            if (ch == '\n') break;
-            ackBuf[idx++] = ch;
+
+            // Jeśli koniec linii '\n' -> kończymy odbieranie
+            if (ch == '\n') {
+                break;
+            }
+
+            // Zbieramy znaki (zabezpieczenie przed przepełnieniem)
+            if (idx < sizeof(ackBuf) - 1) {
+                ackBuf[idx++] = ch;
+            }
         }
     }
 
-    ackBuf[idx] = '\0';
+    ackBuf[idx] = '\0'; // Zamykamy string
 
+    // Opcjonalnie: Debugowanie, odkomentuj jeśli nadal nie działa
+    // if (idx > 0) printf("[DEBUG ACK] Recv: '%s'\r\n", ackBuf);
 
-    if (strcmp(ackBuf, "ACK") == 0) return true;
-    if (strcmp(ackBuf, "NACK") == 0) return false;
+    // Sprawdzamy czy odebrano ACK
+    // Używamy strstr zamiast strcmp, na wypadek gdyby na początku były jakieś śmieci (np. 0x00)
+    if (strstr(ackBuf, "ACK") != NULL) return true;
+
+    // Obsługa NACK
+    if (strstr(ackBuf, "NACK") != NULL) return false;
 
     return false;
 }
+
+
+/* To wklej do pliku stm32f4xx_it.c na samym dole */
+
+
+
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -1597,7 +1928,7 @@ bool waitForAck(UART_HandleTypeDef* uart, uint32_t timeout_ms) {
   * @retval None
   */
 /* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void const * argument)
+void StartDefaultTask(const void *argument)
 {
   /* init code for USB_HOST */
   MX_USB_HOST_Init();
